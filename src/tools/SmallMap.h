@@ -79,6 +79,12 @@ namespace vc4c
                 clear();
             }
 
+            FixedSortedPointerMap(std::initializer_list<value_type> init) : FixedSortedPointerMap()
+            {
+                std::copy(init.begin(), init.end(), data.begin());
+                sort();
+            }
+
             iterator begin() noexcept
             {
                 return data.begin();
@@ -107,7 +113,7 @@ namespace vc4c
 
             bool full() const noexcept
             {
-                // if the first element is not a tombstone, none are, since tombstones are sorted to the end
+                // if the last element is not a tombstone, none are, since tombstones are sorted to the end
                 return data.back().first != reinterpret_cast<K>(TOMBSTONE);
             }
 
@@ -416,6 +422,14 @@ namespace vc4c
             using size_type = typename BigContainer::size_type;
 
             explicit SmallSortedPointerMap() : data(SmallContainer{}) {}
+
+            SmallSortedPointerMap(std::initializer_list<value_type> init)
+            {
+                if(init.size() <= small_size())
+                    data = SmallContainer{*reinterpret_cast<std::initializer_list<std::pair<K, V>>*>(&init)};
+                else
+                    data = BigContainer{init};
+            }
 
             iterator begin() noexcept
             {
