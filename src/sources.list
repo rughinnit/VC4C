@@ -1,0 +1,23 @@
+target_sources(${VC4C_LIBRARY_NAME}
+  PRIVATE
+    BasicBlock.cpp
+    CompilationError.cpp
+    Compiler.cpp
+    Disassembler.cpp
+    Expression.cpp
+    GlobalValues.cpp
+    HalfType.cpp
+    InstructionWalker.cpp
+    Locals.cpp
+    Method.cpp
+    Module.cpp
+    ProcessUtil.cpp
+    Profiler.cpp
+    Register.cpp
+    signals.cpp
+    SIMDVector.cpp
+    ThreadPool.cpp
+    Types.cpp
+    Values.cpp
+    shared/BinaryHeader.cpp
+)

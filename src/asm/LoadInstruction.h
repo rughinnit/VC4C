@@ -1,0 +1,51 @@
+/*
+ * Author: doe300
+ *
+ * See the file "LICENSE" for the full license governing this code.
+ */
+
+#ifndef LOADINSTRUCTION_H
+#define LOADINSTRUCTION_H
+
+#include "Instruction.h"
+namespace vc4c
+{
+    namespace qpu_asm
+    {
+        class LoadInstruction final : public Instruction
+        {
+        public:
+            explicit LoadInstruction(uint64_t code) : Instruction(code) {}
+            LoadInstruction(Pack pack, ConditionCode condAdd, ConditionCode condMul, SetFlag sf, WriteSwap ws,
+                Address addOut, Address mulOut, uint32_t value);
+            LoadInstruction(Pack pack, ConditionCode condAdd, ConditionCode condMul, SetFlag sf, WriteSwap ws,
+                Address addOut, Address mulOut, int16_t value0, int16_t value1);
+            LoadInstruction(Pack pack, ConditionCode condAdd, ConditionCode condMul, SetFlag sf, WriteSwap ws,
+                Address addOut, Address mulOut, uint16_t value0, uint16_t value1);
+
+            std::string toASMString() const;
+            inline bool isValidInstruction() const
+            {
+                if(getSig() != SIGNAL_LOAD_IMMEDIATE)
+                    return false;
+                return getType() == OpLoad::LOAD_IMM_32 || getType() == OpLoad::LOAD_SIGNED ||
+                    getType() == OpLoad::LOAD_UNSIGNED;
+            }
+
+            BITFIELD_ENTRY(Type, OpLoad, 57, Septuple)
+            // NOTE: The pack value includes the pm bit!
+            BITFIELD_ENTRY(Pack, Pack, 52, Quintuple)
+            BITFIELD_ENTRY(AddCondition, ConditionCode, 49, Triple)
+            BITFIELD_ENTRY(MulCondition, ConditionCode, 46, Triple)
+            BITFIELD_ENTRY(SetFlag, SetFlag, 45, Bit)
+
+            BITFIELD_ENTRY(ImmediateInt, uint32_t, 0, Int)
+            BITFIELD_ENTRY(ImmediateShort0, uint16_t, 16, Short)
+            BITFIELD_ENTRY(ImmediateShort1, uint16_t, 0, Short)
+            BITFIELD_ENTRY(ImmediateSignedShort0, int16_t, 16, SignedShort)
+            BITFIELD_ENTRY(ImmediateSignedShort1, int16_t, 0, SignedShort)
+        };
+    } // namespace qpu_asm
+} // namespace vc4c
+
+#endif /* LOADINSTRUCTION_H */

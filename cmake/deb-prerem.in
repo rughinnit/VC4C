@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+rm -f /etc/ld.so.conf.d/99-vc4c.conf
+ldconfig
+rm -rf @CMAKE_INSTALL_PREFIX@/share/vc4cc/

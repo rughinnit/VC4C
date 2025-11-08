@@ -1,0 +1,19 @@
+target_sources(TestVC4C
+  PRIVATE
+    RegressionTest.cpp
+    test.cpp
+    TestAnalyses.cpp
+    TestCustomContainers.cpp
+    TestEmulator.cpp
+    TestExpressions.cpp
+    TestFrontends.cpp
+    TestGraph.cpp
+    TestInstructions.cpp
+    TestIntrinsics.cpp
+    TestMathFunctions.cpp
+    TestOperators.cpp
+    TestOptimizations.cpp
+    TestOptimizationSteps.cpp
+    TestPatternMatching.cpp
+    TestRegisterFixes.cpp
+)

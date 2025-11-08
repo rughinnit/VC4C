@@ -1,0 +1,148 @@
+version: 2
+jobs:
+  check-code-style:
+    docker:
+      - image: nomaddo/native
+    steps:
+      - checkout
+      - run: scripts/clang-format-diff.sh
+  cross:
+    docker:
+      - image: doe300/cross-rpi:buster-llvm11
+    steps:
+      - checkout
+      - run:
+          name: download header
+          command: git clone https://github.com/doe300/VC4CLStdLib.git VC4CLStdLib && cd VC4CLStdLib && cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_NUMBER=$CIRCLE_BUILD_NUM . && make && sudo make install && cd ../
+      - run:
+          name: configure
+          # Use the libLLVM of the default LLVM/CLang, disable search for SPIRV-LLVM
+          command: mkdir build && cd build && LDFLAGS=-Wl,--warn-unresolved-symbols cmake ../ -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_NUMBER=$CIRCLE_BUILD_NUM -DCROSS_COMPILE=ON -DBUILD_TESTING=OFF -DLLVMLIB_FRONTEND=ON -DSPIRV_FRONTEND=OFF -DSPIRV_COMPILER_ROOT=/tmp/skip-searching -DVC4CL_STDLIB_PRECOMPILE=OFF -DSYSROOT_CROSS=/home/idein/cross -DCROSS_COMPILER_PATH=${HOME}/x-tools/armv6-rpi-linux-gnueabihf/bin -DCROSS_COMPILER_PREFIX="armv6-rpi-linux-gnueabihf-"
+      - run:
+          name: make
+          # TODO CicleCI runs out of memory
+          command: cd build && make # -j`nproc`
+      - run:
+          name: deb-packing
+          command: cd build && cpack -G DEB && sudo cpack -G DEB --config ../VC4CLStdLib/CPackConfig.cmake
+      - run:
+          # Raspberry Pi OS Buster only ships with GLIBC 2.28, the cross compiler uses GLIBC 2.29
+          name: check compatibility
+          command: |
+              ${HOME}/x-tools/armv6-rpi-linux-gnueabihf/bin/armv6-rpi-linux-gnueabihf-objdump -x build/src/libVC4CC.so | grep -vzo 'GLIBC_2.29'
+              ${HOME}/x-tools/armv6-rpi-linux-gnueabihf/bin/armv6-rpi-linux-gnueabihf-objdump -x build/src/vc4c | grep -vzo 'GLIBC_2.29'
+      - store_artifacts:
+          path: build/src/libVC4CC.so.0.4
+          distination: libVC4CC.so.0.4
+      - store_artifacts:
+          path: build/src/VC4C
+          distination: VC4C
+      - store_artifacts:
+          path: build/vc4c-0.4-Linux.deb
+          distination: vc4c-0.4-Linux.deb
+      - store_artifacts:
+          path: build/vc4cl-stdlib-0.4-Linux.deb
+          distination: vc4cl-stdlib-0.4-Linux.deb
+  build:
+    docker:
+      - image: doe300/native
+    steps:
+      - checkout
+      - run:
+          name: download header
+          command: git clone https://github.com/doe300/VC4CLStdLib.git VC4CLStdLib && cd VC4CLStdLib && cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_NUMBER=$CIRCLE_BUILD_NUM -DCROSS_COMPILE=OFF . && make install && cd ..
+      - run:
+          name: configure
+          # Use SPIRV-LLVM
+          command: mkdir build && cd build && cmake ../ -DCMAKE_BUILD_TYPE=Debug -DBUILD_NUMBER=$CIRCLE_BUILD_NUM -DBUILD_TESTING=ON -DLLVMLIB_FRONTEND=ON -DSPIRV_FRONTEND=OFF
+      - run:
+          name: make
+          # TODO CicleCI runs out of memory
+          command: cd build && make # -j`nproc`
+      - run:
+          name: deb-packing
+          command: cd build && cpack -G DEB && cpack -G DEB --config ../VC4CLStdLib/CPackConfig.cmake
+      - run: build/src/vc4c --version
+      - store_artifacts:
+          path: build/src/libVC4CC.so.0.4
+          distination: libVC4CC.so.0.4
+      - store_artifacts:
+          path: build/src/VC4C
+          distination: VC4C
+      - store_artifacts:
+          path: build/test/TestVC4C
+          distination: TestVC4C
+      - store_artifacts:
+          path: build/vc4c-0.4-Linux.deb
+          distination: vc4c-0.4-Linux.deb
+      - store_artifacts:
+          path: build/vc4cl-stdlib-0.4-Linux.deb
+          distination: vc4cl-stdlib-0.4-Linux.deb
+      - store_artifacts:
+          path: build/vc4c_testdata-0.4-Linux.deb
+          distination: vc4c_testdata-0.4-Linux.deb
+      - persist_to_workspace:
+          root: /root/project
+          paths:
+            - build/test/TestVC4C
+            - build/cpptest-lite/src/cpptest-lite-project-build/libcpptest-lite.so.0.9
+            - testing
+            - example
+            - build/vc4c-0.4-Linux.deb
+            - build/vc4cl-stdlib-0.4-Linux.deb
+            - build/vc4c_testdata-0.4-Linux.deb
+  test-generic:
+    docker:
+      - image: doe300/native
+    steps:
+      - attach_workspace:
+          at: /root/project
+      - run: dpkg -i build/vc4cl-stdlib-0.4-Linux.deb
+      - run: dpkg -i build/vc4c-0.4-Linux.deb
+      - run: ln -s `pwd`/build/cpptest-lite/src/cpptest-lite-project-build/libcpptest-lite.so.0.9 /usr/lib/libcpptest-lite.so.1.1.2
+      - run: ldconfig
+      - run: build/test/TestVC4C --output=plain --mode=verbose --test-container --test-expressions --test-graph --test-instructions --test-operators --test-optimization-steps --test-patterns
+      - run: dpkg -r vc4c
+      - run: dpkg -r vc4cl-stdlib
+  test-llvm:
+    docker:
+      - image: doe300/native
+    steps:
+      - attach_workspace:
+          at: /root/project
+      - run: dpkg -i build/vc4cl-stdlib-0.4-Linux.deb
+      - run: dpkg -i build/vc4c-0.4-Linux.deb
+      - run: ln -s `pwd`/build/cpptest-lite/src/cpptest-lite-project-build/libcpptest-lite.so.0.9 /usr/lib/libcpptest-lite.so.1.1.2
+      - run: ldconfig
+      - run: build/test/TestVC4C --output=plain --mode=verbose --llvm  --test-emulator --test-frontend --test-intrinsics --test-analyses --regressions
+      - run: dpkg -r vc4c
+      - run: dpkg -r vc4cl-stdlib
+  test-spirv:
+    docker:
+      - image: doe300/native
+    steps:
+      - attach_workspace:
+          at: /root/project
+      - run: dpkg -i build/vc4cl-stdlib-0.4-Linux.deb
+      - run: dpkg -i build/vc4c-0.4-Linux.deb
+      - run: ln -s `pwd`/build/cpptest-lite/src/cpptest-lite-project-build/libcpptest-lite.so.0.9 /usr/lib/libcpptest-lite.so.1.1.2
+      - run: ldconfig
+      - run: build/test/TestVC4C --output=plain --mode=verbose --spirv --test-emulator --test-frontend                   --test-analyses --regressions
+      - run: dpkg -r vc4c
+      - run: dpkg -r vc4cl-stdlib
+workflows:
+  version: 2
+  commit:
+    jobs:
+      - check-code-style
+      - build
+      - cross
+      - test-generic:
+          requires:
+            - build
+      - test-llvm:
+          requires:
+            - build
+      - test-spirv:
+          requires:
+            - build

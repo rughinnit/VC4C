@@ -1,0 +1,20 @@
+# Default build folder
+build/
+coverage/
+
+# Eclipse
+.cproject
+.project
+.csettings/
+.settings/
+
+# Netbeans
+dist/
+nbproject/
+
+# JetBrains
+.idea
+
+# Other
+testResult.log
+/valgrind.supp

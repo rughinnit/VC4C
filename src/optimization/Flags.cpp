@@ -1,0 +1,621 @@
+/*
+ * Author: doe300
+ *
+ * See the file "LICENSE" for the full license governing this code.
+ */
+
+#include "Flags.h"
+
+#include "../InstructionWalker.h"
+#include "../Method.h"
+#include "../analysis/FlagsAnalysis.h"
+#include "../intermediate/IntermediateInstruction.h"
+#include "log.h"
+
+using namespace vc4c;
+using namespace vc4c::optimizations;
+
+static uint8_t countIdenticalElementFlags(const Optional<VectorFlags>& flags)
+{
+    uint8_t count = 0;
+    if(flags)
+    {
+        for(const auto& element : *flags)
+        {
+            if(element == (*flags)[0])
+                ++count;
+            else
+                break;
+        }
+    }
+    return count;
+}
+
+static bool rewriteSettingOfFlags(
+    InstructionWalker setFlags, FastAccessList<InstructionWalker>&& conditionalInstructions)
+{
+    if(conditionalInstructions.empty() && setFlags.get<intermediate::ExtendedInstruction>())
+    {
+        // flags are set but never used
+        if(setFlags->writesRegister(REG_NOP) && !setFlags->getSignal().hasSideEffects())
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Removing unused setting of flags: " << setFlags->to_string() << logging::endl);
+            setFlags.erase();
+            return true;
+        }
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Removing unused SetFlags bit from instruction: " << setFlags->to_string() << logging::endl);
+        setFlags.get<intermediate::ExtendedInstruction>()->setSetFlags(SetFlag::DONT_SET);
+        return true;
+    }
+    auto allFlags = analysis::StaticFlagsAnalysis::analyzeStaticFlags(setFlags.get(), setFlags);
+    auto numIdenticalFlags = countIdenticalElementFlags(allFlags);
+    if(allFlags && numIdenticalFlags == NATIVE_VECTOR_SIZE)
+    {
+        // flags are compile-time static
+        ElementFlags flags = (*allFlags)[0];
+        auto condIt = conditionalInstructions.begin();
+        bool changedInstructions = false;
+        while(condIt != conditionalInstructions.end())
+        {
+            auto extendedInst = condIt->get<intermediate::ExtendedInstruction>();
+            auto branch = condIt->get<intermediate::Branch>();
+            ConditionCode cond = COND_ALWAYS;
+            if(extendedInst)
+                cond = extendedInst->getCondition();
+            else if(branch)
+                cond = branch->branchCondition.toConditionCode();
+            if(flags.isFlagDefined(cond))
+            {
+                if(branch && allFlags->matchesCondition(branch->branchCondition))
+                {
+                    // this branch becomes unconditional
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Making branch with constant condition unconditional: " << (*condIt)->to_string()
+                            << logging::endl);
+                    branch->branchCondition = BRANCH_ALWAYS;
+                    changedInstructions = true;
+                    condIt = conditionalInstructions.erase(condIt);
+                    // TODO now we could also remove the phi-node writes
+                }
+                else if(flags.matchesCondition(cond))
+                {
+                    // condition is statically matched, remove conditional
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Making instruction with constant condition unconditional: " << (*condIt)->to_string()
+                            << logging::endl);
+                    if(extendedInst)
+                        extendedInst->setCondition(COND_ALWAYS);
+                    changedInstructions = true;
+                    condIt = conditionalInstructions.erase(condIt);
+                }
+                else if((*condIt)->hasDecoration(intermediate::InstructionDecorations::PHI_NODE))
+                {
+                    // We can't remove phi-node writes, since otherwise we remove the end of the liveness range (for
+                    // that block), making it possibly "infinite". But we can make this instruction not depend on
+                    // anything else to be able to remove its sources
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Simplifying conditional phi-node which will never be executed: "
+                            << (*condIt)->to_string() << logging::endl);
+                    condIt->reset(intermediate::createWithExtras<intermediate::MoveOperation>(
+                        *(*condIt).get(), (*condIt)->getOutput().value(), UNDEFINED_VALUE));
+                    condIt = conditionalInstructions.erase(condIt);
+                }
+                else
+                {
+                    // condition is statically not matched, remove instruction
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Removing conditional instruction which will never be executed: "
+                            << (*condIt)->to_string() << logging::endl);
+                    condIt->erase();
+                    condIt = conditionalInstructions.erase(condIt);
+                    changedInstructions = true;
+                }
+            }
+            else
+                ++condIt;
+        }
+        if(conditionalInstructions.empty())
+            // to maybe remove the flag
+            rewriteSettingOfFlags(setFlags, FastAccessList<InstructionWalker>{});
+        return changedInstructions;
+    }
+    else if(allFlags && numIdenticalFlags > 0)
+    {
+        ElementFlags flags = (*allFlags)[0];
+        auto condIt = conditionalInstructions.begin();
+        bool changedInstructions = false;
+        while(condIt != conditionalInstructions.end())
+        {
+            auto extendedInst = condIt->get<intermediate::ExtendedInstruction>();
+            if(extendedInst && flags.isFlagDefined(extendedInst->getCondition()) && extendedInst->isSimpleMove())
+            {
+                auto moveSource = extendedInst->getMoveSource();
+                bool flagsCoverOutput =
+                    extendedInst->getOutput() && extendedInst->getOutput()->type.getVectorWidth() <= numIdenticalFlags;
+                bool isSingleWriter =
+                    (check(extendedInst->checkOutputLocal()) & &Local::getSingleWriter) == extendedInst;
+                bool flagsCoverSource = moveSource && moveSource->type.getVectorWidth() <= numIdenticalFlags;
+                bool sourceIsUnconditional = moveSource && moveSource->getConstantValue();
+                if(auto writer = moveSource ? moveSource->getSingleWriter() : nullptr)
+                    sourceIsUnconditional = !writer->hasConditionalExecution();
+                if(flagsCoverOutput && isSingleWriter && flagsCoverSource && sourceIsUnconditional)
+                {
+                    // conditional single writer moving from unconditionally written source all elements specified by
+                    // the input and output types with compile-time constant condition
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Making instruction with constant condition covering all used elements unconditional: "
+                            << (*condIt)->to_string() << logging::endl);
+                    extendedInst->setCondition(COND_ALWAYS);
+                    condIt = conditionalInstructions.erase(condIt);
+                    changedInstructions = true;
+                    continue;
+                }
+            }
+            ++condIt;
+        }
+        if(conditionalInstructions.empty())
+            // to maybe remove the flag
+            rewriteSettingOfFlags(setFlags, FastAccessList<InstructionWalker>{});
+        return changedInstructions;
+    }
+    return false;
+}
+
+std::size_t optimizations::removeUselessFlags(const Module& module, Method& method, const Configuration& config)
+{
+    std::size_t numChanges = 0;
+    for(auto& block : method)
+    {
+        Optional<InstructionWalker> lastSettingOfFlags;
+        FastAccessList<InstructionWalker> conditionalInstructions;
+
+        auto it = block.walk();
+        while(!it.isEndOfBlock())
+        {
+            if(!it.has())
+            {
+                it.nextInBlock();
+                continue;
+            }
+            if(it->hasConditionalExecution())
+                conditionalInstructions.push_back(it);
+            if(it.get<intermediate::Branch>() && !it.get<intermediate::Branch>()->isUnconditional())
+                conditionalInstructions.push_back(it);
+            if(it->doesSetFlag())
+            {
+                if(lastSettingOfFlags)
+                {
+                    // process previous setting of flags
+                    FastAccessList<InstructionWalker> tmp;
+                    std::swap(tmp, conditionalInstructions);
+                    if(rewriteSettingOfFlags(*lastSettingOfFlags, std::move(tmp)))
+                        ++numChanges;
+                }
+                lastSettingOfFlags = it;
+            }
+            it.nextInBlock();
+        }
+
+        if(lastSettingOfFlags)
+        {
+            // process last setting of flags of block
+            if(rewriteSettingOfFlags(*lastSettingOfFlags, std::move(conditionalInstructions)))
+                ++numChanges;
+        }
+    }
+    return numChanges;
+}
+
+InstructionWalker optimizations::combineSameFlags(
+    const Module& module, Method& method, InstructionWalker it, const Configuration& config)
+{
+    if(it.get() == nullptr || !it->doesSetFlag())
+        return it;
+    // only combine writing into NOP-register for now
+    if(it->getOutput() && it->getOutput().value() != NOP_REGISTER)
+        return it;
+    // only remove this setting of flags, if we have no other side effects and don't execute conditionally
+    if(it->getSignal().hasSideEffects() || it->hasConditionalExecution())
+        return it;
+    auto source = it->getMoveSource();
+    if(!source)
+        // only combine setting flags from moves (e.g. for PHI-nodes) for now
+        return it;
+    const Value src = *source;
+
+    InstructionWalker checkIt = it.copy().previousInBlock();
+    while(!checkIt.isStartOfBlock())
+    {
+        if(checkIt.get() && checkIt->doesSetFlag())
+        {
+            if(checkIt->getMoveSource() == src && !checkIt->hasConditionalExecution())
+            {
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Removing duplicate setting of same flags: " << it->to_string() << logging::endl);
+                it.erase();
+                // don't skip next instruction
+                it.previousInBlock();
+            }
+            // otherwise some other flags are set -> cancel
+            return it;
+        }
+        checkIt.previousInBlock();
+    }
+
+    return it;
+}
+
+InstructionWalker optimizations::combineFlagWithOutput(
+    const Module& module, Method& method, InstructionWalker it, const Configuration& config)
+{
+    // XXX this currently never moves the value-moves to the flag-moves, only the flag-moves to the value-moves
+    // -> does not increase local liveness, but on the other side, we could save instructions...
+    if(!it.has() || !it->doesSetFlag())
+        // does not set flags
+        return it;
+    if(!it->writesRegister(REG_NOP))
+        // already has output
+        return it;
+    auto source = it->getMoveSource();
+    if(!source)
+        // only combine setting flags from moves (e.g. for PHI-nodes) for now
+        return it;
+    const auto& in = *source;
+    if(it->getSignal().hasSideEffects() || it->hasConditionalExecution() ||
+        (in.checkRegister() && in.reg().hasSideEffectsOnRead()))
+        // only remove this setting of flags, if we have no other side effects and don't execute conditionally
+        return it;
+    const auto movesFromSameInput = [&](InstructionWalker checkIt) -> bool {
+        auto source = checkIt.has() ? checkIt->getMoveSource() : NO_VALUE;
+        return checkIt.has() && checkIt->isSimpleMove() && source &&
+            (source == in || (in.getLiteralValue() && source->hasLiteral(*in.getLiteralValue())));
+    };
+
+    // look into the future until we hit the instruction requiring the flag
+    auto resultIt = typeSafe<intermediate::ExtendedInstruction>(it.getBasicBlock()->walkEnd());
+    auto checkIt = it.copy().nextInBlock();
+    while(!checkIt.isEndOfBlock())
+    {
+        // this is usually only executed few times, since setting of flags and usage thereof are close to each other
+        if(checkIt.has() &&
+            (checkIt->hasConditionalExecution() || checkIt->doesSetFlag() || checkIt->getOutput() == in))
+            /*
+             * Abort, since we cannot move a setting of flags over:
+             * - a conditional instruction (depending on this flags)
+             * - the next setting of flags
+             * - an instruction writing the flag source
+             */
+            break;
+        if(movesFromSameInput(checkIt))
+        {
+            resultIt = typeSafe<intermediate::ExtendedInstruction>(checkIt);
+            break;
+        }
+        checkIt.nextInBlock();
+    }
+
+    // look back only a few instructions
+    if(resultIt.base().isEndOfBlock())
+    {
+        checkIt = it.copy().previousInBlock();
+        while(!checkIt.isStartOfBlock())
+        {
+            // TODO limit number of steps?
+
+            if(checkIt.has() &&
+                (checkIt->hasConditionalExecution() || checkIt->doesSetFlag() || checkIt->getOutput() == in))
+                /*
+                 * Abort, since we cannot move a setting of flags over:
+                 * - a conditional instruction (depending on the previous flags)
+                 * - the previous setting of flags
+                 * - an instruction writing the flag source
+                 */
+                break;
+            if(movesFromSameInput(checkIt))
+            {
+                resultIt = typeSafe<intermediate::ExtendedInstruction>(checkIt);
+                break;
+            }
+            checkIt.previousInBlock();
+        }
+    }
+    if(!resultIt.base().isEndOfBlock())
+    {
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Combining move to set flags '" << it->to_string()
+                << "' with move to output: " << resultIt->to_string() << logging::endl);
+        resultIt.get()->setSetFlags(SetFlag::SET_FLAGS);
+        // TODO decorations? If input is the same, most decorations are also the same?! Also, setflags usually don't
+        // have that many!?
+        it.erase();
+        // don't skip next instruction
+        it.previousInBlock();
+    }
+    return it;
+}
+
+static bool checkAllResultElementsAreSame(
+    const intermediate::IntermediateInstruction& inst, Optional<InstructionWalker> it, std::size_t stepsRemaining);
+
+static bool checkAllInputElementsAreSame(const Value& input, InstructionWalker it, std::size_t stepsRemaining)
+{
+    bool allElementsSame = input.isAllSame();
+    if(!allElementsSame && stepsRemaining > 0 && input.checkLocal())
+    {
+        allElementsSame = input.local()->allUsers(LocalUse::Type::WRITER, [&](const LocalUser* writer) -> bool {
+            return checkAllResultElementsAreSame(*writer,
+                it.getBasicBlock()->findWalkerForInstruction(writer, it.getBasicBlock()->walk(), it),
+                stepsRemaining - 1);
+        });
+    }
+    return allElementsSame;
+}
+
+static bool checkAllResultElementsAreSame(
+    const intermediate::IntermediateInstruction& inst, Optional<InstructionWalker> it, std::size_t stepsRemaining)
+{
+    if(!inst.hasConditionalExecution() && inst.hasDecoration(intermediate::InstructionDecorations::IDENTICAL_ELEMENTS))
+        return true;
+    if(inst.hasConditionalExecution())
+    {
+        auto flagIt = it ? it->getBasicBlock()->findLastSettingOfFlags(*it) : Optional<InstructionWalker>{};
+        if(flagIt && stepsRemaining > 0 && !flagIt->isEndOfBlock() &&
+            checkAllResultElementsAreSame(*(*flagIt).get(), *flagIt, stepsRemaining - 1))
+            // If we can argue that the (required) flags are set the same for all elements, then the conditional
+            // instruction sets the same value for all elements.
+            return true;
+        // Otherwise, we need to exclude this, since conditional writes would be per-element
+        return false;
+    }
+    if(inst.precalculate().first & &Value::isAllSame)
+        // constant value which is the same in all SIMD elements
+        return true;
+    if(inst.checkOutputLocal() && inst.readsLocal(inst.checkOutputLocal()))
+    {
+        if(dynamic_cast<const intermediate::Operation*>(&inst) &&
+            inst.findOtherArgument(*inst.getOutput()) & &Value::isAllSame)
+            // Assuming the written (and read) variable is all the same across the SIMD vector (which is decided by
+            // the other writers that have to exist), and we only do (any kind of) operation taking another value
+            // which is the same across all SIMD elements, then we know the result to also have this property, since
+            // all (unconditional) operations are independent of the SIMD element. This is e.g. true for iteration
+            // variables.
+            return true;
+
+        // for any other instruction reading its output abort, since we might get to an infinite stack recursion below
+        // when we recursively recheck for the operation inputs
+        return false;
+    }
+
+    if(it && std::all_of(inst.getArguments().begin(), inst.getArguments().end(), [&](const Value& arg) -> bool {
+           return checkAllInputElementsAreSame(arg, *it, stepsRemaining);
+       }))
+        // TODO do we need to exclude some operation types? Or heed some extra option/flags?
+        return true;
+    return false;
+}
+
+static bool checkConditionalsAcceptFlagRewrite(InstructionWalker it, ElementFlags conditionFlags)
+{
+    it.nextInBlock();
+    while(!it.isEndOfBlock() && !it->doesSetFlag())
+    {
+        if(it->hasConditionalExecution())
+            // normal conditionals are per-element, so we cannot rewrite their flag setters
+            return false;
+        if(auto br = it.get<intermediate::Branch>())
+        {
+            if(br->branchCondition == BRANCH_ALL_C_CLEAR || br->branchCondition == BRANCH_ANY_C_SET)
+            {
+                if(conditionFlags.carry != FlagStatus::SET)
+                    return false;
+            }
+            else if(br->branchCondition == BRANCH_ALL_N_CLEAR || br->branchCondition == BRANCH_ANY_N_SET)
+            {
+                if(conditionFlags.negative != FlagStatus::SET)
+                    return false;
+            }
+            else if(br->branchCondition == BRANCH_ALL_Z_CLEAR || br->branchCondition == BRANCH_ANY_Z_SET)
+            {
+                if(conditionFlags.zero != FlagStatus::SET)
+                    return false;
+            }
+            else
+                // any other branch condition will be changed by simplifying the flag setter
+                return br->branchCondition == BRANCH_ALWAYS;
+        }
+        it.nextInBlock();
+    }
+    return true;
+}
+
+InstructionWalker optimizations::simplifyFlag(
+    const Module& module, Method& method, InstructionWalker it, const Configuration& config)
+{
+    if(!it.get() || it->hasConditionalExecution() || !it->doesSetFlag())
+        return it;
+
+    if(it.get<intermediate::MoveOperation>())
+        // is already the simplest case
+        return it;
+
+    if(!it->writesRegister(REG_NOP))
+        // we can only simplify if the output value is not actually used, since we change it
+        return it;
+
+    // check whether we have a supported operation
+    Optional<Value> input = UNDEFINED_VALUE;
+    // these are the allowed flags to depend on which will still be identical after the simplification
+    ElementFlags condFlags{};
+    if(auto op = it.get<intermediate::Operation>())
+    {
+        // this is currently our only supported case
+        if(op->op == OP_OR && op->readsRegister(REG_ELEMENT_NUMBER))
+        {
+            input = op->findOtherArgument(ELEMENT_NUMBER_REGISTER);
+            // for this case, the can simplify if all dependent checks on (not)zero or (not)negative
+            condFlags.zero = FlagStatus::SET;
+            condFlags.negative = FlagStatus::SET;
+        }
+    }
+    if(!input)
+        // unsupported case of flag setter
+        return it;
+
+    // check whether all our inputs are identical over the whole SIMD vector
+    // limit is arbitrary and only for performance reasons to not run into very deep recursions
+    if(!checkAllInputElementsAreSame(*input, it, 8))
+        return it;
+
+    // check all depending conditional executions, whether they allow us to change the flags
+    if(!checkConditionalsAcceptFlagRewrite(it, condFlags))
+        return it;
+
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Simplifying flag setter '" << it->to_string()
+            << "', all conditional instructions will behave the same afterwards" << logging::endl);
+    it.reset(intermediate::createWithExtras<intermediate::MoveOperation>(*it.get(), it->getOutput().value(), *input))
+        .setSetFlags(SetFlag::SET_FLAGS);
+    return it;
+}
+
+// Returns (if matching) the condition for the boolean true value
+static Optional<ConditionCode> getConditionalBooleanWrites(const Value& val, InstructionWalker it)
+{
+    // check source local
+    auto loc = val.checkLocal();
+    if(!loc)
+        return {};
+    // check local written exactly twice
+    auto writers = loc->getUsers(LocalUse::Type::WRITER);
+    if(writers.size() != 2)
+        return {};
+    // check local writes are within the same block
+    std::vector<TypedInstructionWalker<intermediate::ExtendedInstruction>> writerWalkers;
+    for(auto writer : writers)
+    {
+        if(auto writerIt = it.getBasicBlock()->findWalkerForInstruction(writer, it.getBasicBlock()->walk(), it))
+            writerWalkers.emplace_back(typeSafe<intermediate::ExtendedInstruction>(*writerIt));
+        else
+            return {};
+    }
+    // check writes are conditional with inverted conditions
+    if(!writerWalkers.front()->hasConditionalExecution() || !writerWalkers.back()->hasConditionalExecution())
+        return {};
+    if(!writerWalkers.front().get()->getCondition().isInversionOf(writerWalkers.back().get()->getCondition()))
+        return {};
+    // check writes are conditional on the same setting of flags
+    auto firstFlagIt = it.getBasicBlock()->findLastSettingOfFlags(writerWalkers.front());
+    auto secondFlagIt = it.getBasicBlock()->findLastSettingOfFlags(writerWalkers.back());
+    if(!firstFlagIt || firstFlagIt != secondFlagIt)
+        return {};
+    // check the flags setter for the conditional value is also the last flag setter in the block as seen from the
+    // current flag setter
+    auto selfFlagIt = it.getBasicBlock()->findLastSettingOfFlags(it);
+    if(!selfFlagIt || *selfFlagIt != *firstFlagIt || *selfFlagIt != *secondFlagIt)
+        return {};
+    // check written values are boolean true or false
+    auto firstValue = writerWalkers.front()->precalculate().first;
+    auto secondValue = writerWalkers.back()->precalculate().first;
+    if(!firstValue || !secondValue)
+        return {};
+    if(firstValue == BOOL_TRUE && secondValue == BOOL_FALSE)
+        return writerWalkers.front().get()->getCondition();
+    if(firstValue == BOOL_FALSE && secondValue == BOOL_TRUE)
+        return writerWalkers.back().get()->getCondition();
+    return {};
+}
+
+static bool checkAllConditionalsMatchingCondition(
+    InstructionWalker pos, ConditionCode code, FastAccessList<InstructionWalker>& conditionalInstructions)
+{
+    pos.nextInBlock();
+    while(!pos.isEndOfBlock())
+    {
+        if(pos.get())
+        {
+            if(pos->doesSetFlag())
+                // next setting of flags, end
+                return !pos->hasConditionalExecution();
+
+            auto condCode = code;
+            if(pos->hasConditionalExecution())
+            {
+                condCode = pos.get<intermediate::ExtendedInstruction>()->getCondition();
+                conditionalInstructions.emplace_back(pos);
+            }
+            else if(auto br = pos.get<intermediate::Branch>())
+            {
+                condCode = br->branchCondition.toConditionCode();
+                conditionalInstructions.emplace_back(pos);
+            }
+            if(condCode != code && !condCode.isInversionOf(code))
+                // conditional instruction depending on different flags
+                return false;
+        }
+        pos.nextInBlock();
+    }
+    return true;
+}
+
+std::size_t optimizations::removeConditionalFlags(const Module& module, Method& method, const Configuration& config)
+{
+    std::size_t numChanges = 0;
+    for(auto& block : method)
+    {
+        if(block.empty())
+            continue;
+        auto it = block.walk();
+        while(!it.isEndOfBlock())
+        {
+            auto moveSource = it->getMoveSource();
+            FastAccessList<InstructionWalker> conditionalInstructions;
+            if(moveSource && it->doesSetFlag() && it->writesRegister(REG_NOP) &&
+                checkAllConditionalsMatchingCondition(it, COND_ZERO_SET, conditionalInstructions))
+            {
+                // very simple case, move of some variable to to NOP to set zero/non-zero flags
+                if(auto cond = getConditionalBooleanWrites(*moveSource, it))
+                {
+                    // move sets non-zero, iff cond is set, otherwise it sets zero
+                    // we can replace all checks for zero/non-zero with the cond (and its inversion) and remove this
+                    // flag setter
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Removing superfluous conditional setting of flags by making all dependent conditional "
+                               "instruction dependent on the original flags instead: "
+                            << it->to_string() << logging::endl);
+                    for(auto condIt : conditionalInstructions)
+                    {
+                        if(auto inst = condIt.get<intermediate::ExtendedInstruction>())
+                            inst->setCondition(inst->getCondition() == COND_ZERO_CLEAR ? *cond : cond->invert());
+                        else if(auto br = condIt.get<intermediate::Branch>())
+                        {
+                            // at least after running some of the optimizations above, this can happen
+                            if(br->branchCondition == BRANCH_ALL_Z_CLEAR)
+                                // TODO simplify this, so ALL_SET and ALL_CLEAR are both created from SET/CLEAR and true
+                                // flag?
+                                br->branchCondition = cond->toBranchCondition(true);
+                            else if(br->branchCondition == BRANCH_ALL_Z_SET)
+                                br->branchCondition = cond->invert().toBranchCondition(true);
+                            else if(br->branchCondition == BRANCH_ANY_Z_CLEAR)
+                                br->branchCondition = cond->toBranchCondition(false);
+                            else if(br->branchCondition == BRANCH_ANY_Z_SET)
+                                br->branchCondition = cond->invert().toBranchCondition(false);
+                        }
+                        else
+                            throw CompilationError(CompilationStep::OPTIMIZER,
+                                "Unhandled type of conditional instruction", condIt->to_string());
+                        ++numChanges;
+                    }
+                    ++numChanges;
+                    it.erase();
+                    // to not skip the next instruction
+                    it.previousInBlock();
+                }
+            }
+            it.nextInBlock();
+        }
+    }
+
+    return numChanges;
+}
