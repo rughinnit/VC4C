@@ -824,7 +824,7 @@ void TestInstructions::testOpCodeFlags()
         return false;
     };
 
-    auto INT_MAX = Value(Literal(0x7FFFFFFFu), TYPE_INT32);
+    auto INT_MAX_VALUE = Value(Literal(0x7FFFFFFFu), TYPE_INT32);
     auto FLOAT_MINUS_ONE = Value(Literal(-1.0f), TYPE_FLOAT);
 
     TEST_ASSERT(checkFlagClear(OP_ADD(INT_ONE, INT_ONE).second, FlagsMask::ZERO))
@@ -834,7 +834,7 @@ void TestInstructions::testOpCodeFlags()
     TEST_ASSERT(checkFlagSet(OP_ADD(INT_ONE, INT_MINUS_ONE).second, FlagsMask::ZERO))
     TEST_ASSERT(checkFlagSet(OP_ADD(INT_MINUS_ONE, INT_MINUS_ONE).second, FlagsMask::NEGATIVE))
     TEST_ASSERT(checkFlagSet(OP_ADD(INT_MINUS_ONE, INT_MINUS_ONE).second, FlagsMask::CARRY))
-    TEST_ASSERT(checkFlagSet(OP_ADD(INT_MAX, INT_MAX).second, FlagsMask::SIGNED_OVERFLOW))
+    TEST_ASSERT(checkFlagSet(OP_ADD(INT_MAX_VALUE, INT_MAX_VALUE).second, FlagsMask::SIGNED_OVERFLOW))
 
     TEST_ASSERT(checkFlagClear(OP_AND(INT_ONE, INT_ONE).second, FlagsMask::ZERO))
     TEST_ASSERT(checkFlagClear(OP_AND(INT_ONE, INT_ONE).second, FlagsMask::NEGATIVE))
@@ -977,7 +977,7 @@ void TestInstructions::testOpCodeFlags()
     TEST_ASSERT(checkFlagSet(OP_SUB(INT_ONE, INT_ONE).second, FlagsMask::ZERO))
     TEST_ASSERT(checkFlagSet(OP_SUB(INT_MINUS_ONE, INT_ONE).second, FlagsMask::NEGATIVE))
     TEST_ASSERT(checkFlagClear(OP_SUB(INT_MINUS_ONE, INT_ONE).second, FlagsMask::CARRY))
-    TEST_ASSERT(checkFlagSet(OP_SUB(INT_MAX, INT_MINUS_ONE).second, FlagsMask::SIGNED_OVERFLOW))
+    TEST_ASSERT(checkFlagSet(OP_SUB(INT_MAX_VALUE, INT_MINUS_ONE).second, FlagsMask::SIGNED_OVERFLOW))
 
     TEST_ASSERT(checkFlagClear(OP_XOR(INT_ONE, INT_MINUS_ONE).second, FlagsMask::ZERO))
     TEST_ASSERT(checkFlagClear(OP_XOR(INT_ONE, INT_ONE).second, FlagsMask::NEGATIVE))
@@ -2426,7 +2426,7 @@ void TestInstructions::testOpCodeEmulation()
         {OP_FMINABS, TEST_OP_FMINABS},
         {OP_FMAXABS, TEST_OP_FMAXABS},
         {OP_FTOI, TEST_OP_FTOI},
-        // TODO has rounding error in CI for RelWithDebInfo build (not for Debug build) with itof INT_MAX
+        // TODO has rounding error in CI for RelWithDebInfo build (not for Debug build) with itof INT_MAX_VALUE
         // {OP_ITOF, TEST_OP_ITOF},
         {OP_ADD, TEST_OP_ADD},
         {OP_SUB, TEST_OP_SUB},
@@ -2517,7 +2517,7 @@ void TestInstructions::testOpCodePackEmulation()
         {OP_FMINABS, TEST_PACK_FMINABS},
         {OP_FMAXABS, TEST_PACK_FMAXABS},
         {OP_FTOI, TEST_PACK_FTOI},
-        // TODO has rounding error in CI for RelWithDebInfo build (not for Debug build) with itof INT_MAX
+        // TODO has rounding error in CI for RelWithDebInfo build (not for Debug build) with itof INT_MAX_VALUE
         // {OP_ITOF, TEST_PACK_ITOF},
         {OP_ADD, TEST_PACK_ADD},
         {OP_SUB, TEST_PACK_SUB},

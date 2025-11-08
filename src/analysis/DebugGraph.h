@@ -9,6 +9,7 @@
 
 #include "../Graph.h"
 
+#include <cstdint>
 #include <fstream>
 #include <functional>
 

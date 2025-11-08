@@ -7,6 +7,7 @@
 #ifndef VC4C_CONFIG_H
 #define VC4C_CONFIG_H
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>

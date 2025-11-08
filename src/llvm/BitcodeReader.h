@@ -82,6 +82,27 @@ namespace vc4c
             void extractSPIRMetadata(
                 Module& module, Method& kernel, const llvm::Function& func, const llvm::Module& llvmModule);
         };
+#else
+        class BitcodeReader final : public Parser
+        {
+        public:
+            BitcodeReader(const precompilation::TypedCompilationData<SourceType::LLVM_IR_BIN>& inputData)
+            {
+                throw CompilationError(CompilationStep::GENERAL, "LLVM front-end is not available!");
+            }
+
+            BitcodeReader(const precompilation::TypedCompilationData<SourceType::LLVM_IR_TEXT>& inputData)
+            {
+                throw CompilationError(CompilationStep::GENERAL, "LLVM front-end is not available!");
+            }
+
+            ~BitcodeReader() override = default;
+
+            void parse(Module& module) override
+            {
+                throw CompilationError(CompilationStep::GENERAL, "LLVM front-end is not available!");
+            }
+        };
 #endif
 
     } /* namespace llvm2qasm */

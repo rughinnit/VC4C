@@ -1,3 +1,5 @@
+**NOTE: This project is no longer under active development!**
+
 # Status
 
 [![CircleCI](https://circleci.com/gh/doe300/VC4C.svg?style=svg)](https://circleci.com/gh/doe300/VC4C)

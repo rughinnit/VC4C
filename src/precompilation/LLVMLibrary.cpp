@@ -288,4 +288,25 @@ LLVMProfilerWrapper::~LLVMProfilerWrapper()
     LCOV_EXCL_STOP
 #endif
 }
+#else  /* USE_LLVM_LIBRARY */
+namespace vc4c
+{
+    namespace precompilation
+    {
+        void disassembleLLVMLibrary(const LLVMIRData&, LLVMIRTextData&)
+        {
+            throw CompilationError(CompilationStep::GENERAL, "LLVM library is not available!");
+        }
+
+        void assembleLLVMLibrary(const LLVMIRTextData&, LLVMIRData&)
+        {
+            throw CompilationError(CompilationStep::GENERAL, "LLVM library is not available!");
+        }
+
+        std::unique_ptr<LLVMCompilationData> createLLVMCompilationData()
+        {
+            return nullptr;
+        }
+    } // namespace precompilation
+} // namespace vc4c
 #endif /* USE_LLVM_LIBRARY */

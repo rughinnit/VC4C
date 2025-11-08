@@ -92,12 +92,14 @@ static void printHelp()
               << std::endl;
 }
 
+#ifdef USE_LLVM_LIBRARY
 static std::string toVersionString(unsigned version)
 {
     std::stringstream s;
     s << (static_cast<float>(version) / 10.0f);
     return s.str();
 }
+#endif
 
 static void printInfo()
 {

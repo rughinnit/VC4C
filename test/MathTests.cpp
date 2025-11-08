@@ -71,56 +71,58 @@ using UnaryFunction = MathFunction<std::function<float(float)>>;
 using BinaryFunction = MathFunction<std::function<float(float, float)>>;
 using TernaryFunction = MathFunction<std::function<float(float, float, float)>>;
 
-static float acospi(float f)
+namespace funcs
 {
-    return acosf(f) / static_cast<float>(M_PI);
-}
+    static float acospi(float f)
+    {
+        return acosf(f) / static_cast<float>(M_PI);
+    }
 
-static float asinpi(float f)
-{
-    return asinf(f) / static_cast<float>(M_PI);
-}
+    static float asinpi(float f)
+    {
+        return asinf(f) / static_cast<float>(M_PI);
+    }
 
-static float atanpi(float f)
-{
-    return atanf(f) / static_cast<float>(M_PI);
-}
+    static float atanpi(float f)
+    {
+        return atanf(f) / static_cast<float>(M_PI);
+    }
 
-static float atan2pi(float x, float y)
-{
-    return atan2f(x, y) / static_cast<float>(M_PI);
-}
+    static float atan2pi(float x, float y)
+    {
+        return atan2f(x, y) / static_cast<float>(M_PI);
+    }
 
-static float cospi(float f)
-{
-    return cosf(static_cast<float>(M_PI) * f);
-}
+    static float cospi(float f)
+    {
+        return cosf(static_cast<float>(M_PI) * f);
+    }
 
-static float maxmag(float x, float y)
-{
-    return std::fabs(x) > std::fabs(y) ? x : std::fabs(y) > std::fabs(x) ? y : std::fmax(x, y);
-}
+    static float maxmag(float x, float y)
+    {
+        return std::fabs(x) > std::fabs(y) ? x : std::fabs(y) > std::fabs(x) ? y : std::fmax(x, y);
+    }
 
-static float minmag(float x, float y)
-{
-    return std::fabs(x) < std::fabs(y) ? x : std::fabs(y) < std::fabs(x) ? y : std::fmin(x, y);
-}
+    static float minmag(float x, float y)
+    {
+        return std::fabs(x) < std::fabs(y) ? x : std::fabs(y) < std::fabs(x) ? y : std::fmin(x, y);
+    }
 
-static float rsqrt(float f)
-{
-    return 1.0f / sqrtf(f);
-}
+    static float rsqrt(float f)
+    {
+        return 1.0f / sqrtf(f);
+    }
 
-static float sinpi(float f)
-{
-    return sinf(static_cast<float>(M_PI) * f);
-}
+    static float sinpi(float f)
+    {
+        return sinf(static_cast<float>(M_PI) * f);
+    }
 
-static float tanpi(float f)
-{
-    return tanf(static_cast<float>(M_PI) * f);
-}
-
+    static float tanpi(float f)
+    {
+        return tanf(static_cast<float>(M_PI) * f);
+    }
+} // namespace funcs
 /*
  * As of OpenCL C 1.2 specification, 7.5.2. Changes to C99 TC2 Behavior:
  *
@@ -158,18 +160,18 @@ void test_data::registerMathTests()
     const std::vector<UnaryFunction> unaryFunctions = {
         {"acos", acosf, 4},
         {"acosh", acoshf, 4, DataFilter::DISABLED},
-        {"acospi", acospi, 5},
+        {"acospi", funcs::acospi, 5},
         {"asin", asinf, 4},
         {"asinh", asinhf, 4, DataFilter::DISABLED},
-        {"asinpi", asinpi, 5},
+        {"asinpi", funcs::asinpi, 5},
         {"atan", atanf, 5},
         {"atanh", atanhf, 5, DataFilter::DISABLED},
-        {"atanpi", atanpi, 5},
+        {"atanpi", funcs::atanpi, 5},
         {"cbrt", cbrtf, 4, DataFilter::DISABLED},
         {"ceil", ceilf, 0},
         {"cos", cosf, 4, DataFilter::DISABLED},
         {"cosh", coshf, 4, DataFilter::DISABLED},
-        {"cospi", cospi, 4, DataFilter::DISABLED},
+        {"cospi", funcs::cospi, 4, DataFilter::DISABLED},
         {"erfc", erfcf, 16, DataFilter::DISABLED},
         {"erf", erff, 16, DataFilter::DISABLED},
         {"exp", expf, 4},
@@ -187,14 +189,14 @@ void test_data::registerMathTests()
         // TODO host truncates to zero where it should not
         {"rint", rintf, 0, DataFilter::DISABLED},
         {"round", roundf, 0},
-        {"rsqrt", rsqrt, 4},
+        {"rsqrt", funcs::rsqrt, 4},
         {"sin", sinf, 4, DataFilter::DISABLED},
         {"sinh", sinhf, 4, DataFilter::DISABLED},
-        {"sinpi", sinpi, 4, DataFilter::DISABLED},
+        {"sinpi", funcs::sinpi, 4, DataFilter::DISABLED},
         {"sqrt", sqrtf, 4},
         {"tan", tanf, 5, DataFilter::DISABLED},
         {"tanh", tanhf, 5, DataFilter::DISABLED},
-        {"tanpi", tanpi, 6, DataFilter::DISABLED},
+        {"tanpi", funcs::tanpi, 6, DataFilter::DISABLED},
         {"tgamma", tgammaf, 16, DataFilter::DISABLED},
         {"trunc", truncf, 0},
     };
@@ -213,7 +215,7 @@ void test_data::registerMathTests()
 
     const std::vector<BinaryFunction> binaryFunctions = {
         {"atan2", atan2f, 6, DataFilter::DISABLED},
-        {"atan2pi", atan2pi, 6, DataFilter::DISABLED},
+        {"atan2pi", funcs::atan2pi, 6, DataFilter::DISABLED},
         {"copysign", copysignf, 0},
         {"fdim", fdimf, 0},
         // SPIR-V maps them directly to the fmin/fmax opcode which does not handle NaN correctly
@@ -221,8 +223,8 @@ void test_data::registerMathTests()
         {"fmin", fminf, 0, DataFilter::SPIRV_DISABLED},
         {"fmod", fmodf, 0, DataFilter::DISABLED},
         {"hypot", hypotf, 4, DataFilter::DISABLED},
-        {"maxmag", maxmag, 0},
-        {"minmag", minmag, 0},
+        {"maxmag", funcs::maxmag, 0},
+        {"minmag", funcs::minmag, 0},
         {"nextafter", nextafterf, 0},
         {"pow", powf, 16, DataFilter::DISABLED},
         {"powr", powf, 16, DataFilter::DISABLED},

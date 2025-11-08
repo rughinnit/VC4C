@@ -7,6 +7,7 @@
 #ifndef HELPER_H
 #define HELPER_H
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <set>

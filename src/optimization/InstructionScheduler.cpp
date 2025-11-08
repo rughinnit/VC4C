@@ -89,7 +89,7 @@ struct NodeSorter : public std::less<intermediate::IntermediateInstruction*>
         return -priority;
     }
 
-    bool operator()(intermediate::IntermediateInstruction* x, intermediate::IntermediateInstruction* y)
+    bool operator()(intermediate::IntermediateInstruction* x, intermediate::IntermediateInstruction* y) const
     {
         int prioX = 0;
         auto it = priorities.find(x);
@@ -109,7 +109,7 @@ struct NodeSorter : public std::less<intermediate::IntermediateInstruction*>
     }
 
     // caches priorities per instruction, so we do not have to re-calculate them
-    FastMap<intermediate::IntermediateInstruction*, int> priorities;
+    mutable FastMap<intermediate::IntermediateInstruction*, int> priorities;
 
     explicit NodeSorter(std::size_t numEntries)
     {
