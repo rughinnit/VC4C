@@ -768,7 +768,18 @@ NODISCARD static InstructionWalker insertAddressResetBlock(
     assign(it, maxGroupIdY) = (UNIFORM_REGISTER, decorations);
     assign(it, maxGroupIdZ) = (UNIFORM_REGISTER, decorations);
     assign(it, Value(REG_UNIFORM_ADDRESS, TYPE_INT32)) = (tmp, InstructionDecorations::IDENTICAL_ELEMENTS);
-    return it;
+    // Broadcom AG100-R p.22: at least two non-uniform-accessing instructions must follow a
+    // change of the uniform base pointer before uniforms may be read again. The following
+    // instructions are the loop increment/compare/branch, but that distance is not guaranteed
+    // by the dependency graph (it is built per basic block), so make the gap explicit.
+    // NOTE: assign() takes the walker by value, so `it` still points at the end of the block,
+    // i.e. right behind the uniform pointer write. Keep a copy of that boundary: emplace() moves
+    // the walker onto the inserted instruction, and returning that position would make the next
+    // emplaceLabel() move the NOPs into the following block.
+    auto gapEnd = it;
+    it.emplace(std::make_unique<intermediate::Nop>(intermediate::DelayType::WAIT_UNIFORM));
+    it.emplace(std::make_unique<intermediate::Nop>(intermediate::DelayType::WAIT_UNIFORM));
+    return gapEnd;
 }
 
 // For every dimension insert a block which
