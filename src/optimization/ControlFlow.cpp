@@ -886,6 +886,8 @@ static bool usesWorkItemSpecificBuiltins(const Method& kernel)
 }
 
 /**
+ * Whether the work-item executions (QPUs) of the work-group loop need to be synchronized between two iterations.
+ *
  * We need to synchronize the execution paths of all work-item executions (QPUs).
  *
  * This is required due to some work-item executions might still be stuck in the previous work-group iteration (e.g. if
@@ -898,8 +900,51 @@ static bool usesWorkItemSpecificBuiltins(const Method& kernel)
  * To avoid this, we need to make sure all work-item executions are done with the previous work-group iteration before
  * any of them can start executing the next work-group iteration. The expected behavior is very similar to the
  * barrier(...) OpenCL C function.
+ *
+ * Returns the reason why the synchronization can be skipped, or no value if a synchronization block is required. This
+ * is also used to decide whether the work-group loop can be used for kernels with merged work-items, for which the
+ * semaphore-based barrier of the synchronization block cannot be used (see addWorkGroupLoop()).
  */
-static bool insertSynchronizationBlock(Method& method, BasicBlock& lastBlock)
+static Optional<const char*> getWorkItemSynchronizationSkipReason(const Method& method)
+{
+    if(has_flag(method.flags, MethodFlags::TRAILING_CONTROL_FLOW_BARRIER) ||
+        has_flag(method.flags, MethodFlags::LEADING_CONTROL_FLOW_BARRIER))
+    {
+        // If there is already a control flow barrier at the end of the kernel code (e.g. as inserted by writing back
+        // memory cached in VPM), don't insert another barrier, since all work-items are already synchronized!
+        // That same counts for any control flow barrier at the beginning of the kernel code (e.g. as inserted by
+        // pre-loading memory into VPM cache).
+        return "already trailing barrier in kernel code!";
+    }
+
+    if(method.metaData.getFixedWorkGroupSize() == 1u)
+    {
+        // Only a single work-item (per work-group), so no need to synchronize, since all work-items/work-groups are
+        // guaranteed to be executed serially.
+        return "single work-item per work-group!";
+    }
+
+    if(has_flag(method.flags, MethodFlags::NO_UNGUARDED_CROSS_ITEM_MEMORY_DEPENDENCIES))
+    {
+        // There is no memory written which is read by another work-item, so we cannot run into data races there!
+        return "absence of cross-item data dependencies!";
+    }
+
+    if(!usesWorkItemSpecificBuiltins(method))
+    {
+        // If no work-item specific built-ins are used, all kernels execute exactly on the same data (i.e. if the kernel
+        // would be executed by multiple work-items, it would race anyway), since all other parameters (and therefore
+        // memory addresses) are identical across all invocations within (across work-items and work-groups).
+        return "kernel having no dependencies on work-item ids!";
+    }
+
+    return {};
+}
+
+// Inserts the block synchronizing all work-item executions between two work-group loop iterations, unless the given
+// reason states that no synchronization is required.
+static bool insertSynchronizationBlock(
+    Method& method, BasicBlock& lastBlock, const Optional<const char*>& synchronizationSkipReason)
 {
     // TODO move this synchronization block(s) after the work-group loop, to skip for last work-group?!
 
@@ -911,45 +956,10 @@ static bool insertSynchronizationBlock(Method& method, BasicBlock& lastBlock)
     auto& syncBlock = *it.getBasicBlock();
     intermediate::redirectAllBranches(lastBlock, syncBlock);
 
-    if(has_flag(method.flags, MethodFlags::TRAILING_CONTROL_FLOW_BARRIER) ||
-        has_flag(method.flags, MethodFlags::LEADING_CONTROL_FLOW_BARRIER))
+    if(synchronizationSkipReason)
     {
-        // If there is already a control flow barrier at the end of the kernel code (e.g. as inserted by writing back
-        // memory cached in VPM), don't insert another barrier, since all work-items are already synchronized!
-        // That same counts for any control flow barrier at the beginning of the kernel code (e.g. as inserted by
-        // pre-loading memory into VPM cache).
         CPPLOG_LAZY(logging::Level::DEBUG,
-            log << "Skipping work-item synchronization block due to already trailing barrier in kernel code!"
-                << logging::endl);
-        return false;
-    }
-
-    if(method.metaData.getFixedWorkGroupSize() == 1u)
-    {
-        // Only a single work-item (per work-group), so no need to synchronize, since all work-items/work-groups are
-        // guaranteed to be executed serially.
-        CPPLOG_LAZY(logging::Level::DEBUG,
-            log << "Skipping work-item synchronization block due to single work-item per work-group!" << logging::endl);
-        return false;
-    }
-
-    if(has_flag(method.flags, MethodFlags::NO_UNGUARDED_CROSS_ITEM_MEMORY_DEPENDENCIES))
-    {
-        // There is no memory written which is read by another work-item, so we cannot run into data races there!
-        CPPLOG_LAZY(logging::Level::DEBUG,
-            log << "Skipping work-item synchronization block due to absence of cross-item data dependencies!"
-                << logging::endl);
-        return false;
-    }
-
-    if(!usesWorkItemSpecificBuiltins(method))
-    {
-        // If no work-item specific built-ins are used, all kernels execute exactly on the same data (i.e. if the kernel
-        // would be executed by multiple work-items, it would race anyway), since all other parameters (and therefore
-        // memory addresses) are identical across all invocations within (across work-items and work-groups).
-        CPPLOG_LAZY(logging::Level::DEBUG,
-            log << "Skipping work-item synchronization block for kernel having no dependencies on work-item ids!"
-                << logging::endl);
+            log << "Skipping work-item synchronization block due to " << *synchronizationSkipReason << logging::endl);
         return false;
     }
 
@@ -970,14 +980,22 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
 {
     if(method.walkAllInstructions().isEndOfMethod())
         return 0u;
-    if(method.metaData.mergedWorkItemsFactor > 1)
+
+    // The synchronization block between two work-group loop iterations uses a control flow barrier, which is
+    // implemented via semaphores indexed by the work-item. These cannot be expressed for 16 merged work-items running
+    // in parallel on the SIMD lanes of one QPU. If no synchronization is required (e.g. because there are no
+    // cross-work-item memory dependencies), the loop itself is unaffected by the merging: it only iterates the
+    // work-group ID, which is uniform across all work-items of the work-group and therefore also across all SIMD lanes
+    // of a merged execution.
+    const auto synchronizationSkipReason = getWorkItemSynchronizationSkipReason(method);
+    if(method.metaData.mergedWorkItemsFactor > 1 && !synchronizationSkipReason)
     {
-        // The work-group loop synchronizes the work-items of the work-group between two loop iterations via semaphores,
-        // which are indexed by the work-item and therefore cannot be used with 16 merged work-items per QPU. Without
-        // the loop, every work-group is launched separately by the run-time (which still runs 16 work-items in
+        // Without the loop, every work-group is launched separately by the run-time (which still runs 16 work-items in
         // parallel), so the cross-work-group ordering is guaranteed.
         CPPLOG_LAZY(logging::Level::WARNING,
-            log << "Skipping work-group loop for kernel with merged work-items: " << method.name << logging::endl);
+            log << "Skipping work-group loop for kernel with merged work-items, which requires work-item "
+                   "synchronization: "
+                << method.name << logging::endl);
         return 0u;
     }
     CPPLOG_LAZY(
@@ -1007,7 +1025,7 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
     bool groupIdsNotUsed = moveGroupIdInitializers(method, defaultBlock, startBlock);
 
     // Insert a block to synchronize all work-item/QPUs to avoid data races between work-group iterations
-    auto syncBlockInserted = insertSynchronizationBlock(method, *lastBlock);
+    auto syncBlockInserted = insertSynchronizationBlock(method, *lastBlock, synchronizationSkipReason);
     PROFILE_COUNTER(vc4c::profiler::COUNTER_OPTIMIZATION, "Work-group synchronization blocks", syncBlockInserted);
 
     // Insert all the code required to increment/reset the ids and repeat the kernel code

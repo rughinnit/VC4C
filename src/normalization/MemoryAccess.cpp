@@ -277,7 +277,8 @@ static bool hasOnlyAddressesDerivateOfGroupId(const MemoryAccessRange& range, un
     return false;
 }
 
-static bool mayHaveCrossWorkItemMemoryDependency(const Local* memoryObject, const MemoryInfo& info)
+static bool mayHaveCrossWorkItemMemoryDependency(
+    const Local* memoryObject, const MemoryInfo& info, uint8_t workItemMergeFactor)
 {
     // TODO to be precise, we need an alias check here too!
     if(memoryObject && memoryObject->residesInConstantMemory())
@@ -300,13 +301,22 @@ static bool mayHaveCrossWorkItemMemoryDependency(const Local* memoryObject, cons
 
     if(info.ranges)
     {
+        // With merged work-items, a single memory access is executed by all merged work-items at once (one element per
+        // SIMD lane), so the access width to compare against the per-work-item offset factor is the factor of a single
+        // work-item times the number of merged work-items. The merged work-items are consecutive along dimension 0 and
+        // the run-time only allows local sizes which are a multiple of the merge factor, so an access fitting into the
+        // offsets of the merged work-items cannot overlap with the access of another work-item. The same property is
+        // verified (before the vector width propagation) by checkWorkItemMerging(), which also ensures that the
+        // lane-dependent addresses advance by exactly one element per work-item.
+        const auto mergeFactor = std::max<std::size_t>(workItemMergeFactor, std::size_t{1});
+
         unsigned minFactor = std::numeric_limits<unsigned>::max();
         unsigned maxSize = 0;
         if(std::all_of(info.ranges->begin(), info.ranges->end(),
                [&](const MemoryAccessRange& range) -> bool {
                    return hasOnlyAddressesDerivateOfLocalId(range, minFactor, maxSize);
                }) &&
-            maxSize <= minFactor)
+            maxSize <= static_cast<std::size_t>(minFactor) * mergeFactor)
             // If we manged to figure out the dynamic address parts to be (a derivation of) the local or global id, and
             // the maximum accessed vector size is not larger than the minimum accessed local/global id factor, then we
             // don't have data dependencies across different local ids.
@@ -416,9 +426,11 @@ void normalization::mapMemoryAccess(const Module& module, Method& method, const 
         }
     }
 
-    if(std::none_of(infos.begin(), infos.end(), [](const std::pair<const Local*, MemoryInfo>& info) -> bool {
-           return mayHaveCrossWorkItemMemoryDependency(info.first, info.second);
-       }))
+    if(std::none_of(infos.begin(), infos.end(),
+           [&](const std::pair<const Local*, MemoryInfo>& info) -> bool {
+               return mayHaveCrossWorkItemMemoryDependency(
+                   info.first, info.second, method.metaData.mergedWorkItemsFactor);
+           }))
         // We can reason that no work-item (across work-group loops) accesses memory written by another work-item
         // (except maybe the work-item of the previous loop with the same local ID) and thus we can omit the work-group
         // synchronization barrier blocks, since there is no possible data races we need to guard against.
