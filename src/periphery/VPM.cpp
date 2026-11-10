@@ -313,9 +313,32 @@ static uint8_t getVPMDMAMode(uint8_t scalarBitCount)
     }
 }
 
+/*
+ * Returns whether data of the given type can be staged in a single VPM row for a DMA write.
+ *
+ * 64-bit types as well as complex types which are not stored as a single value are written to two VPM rows by the QPUs,
+ * so they cannot be staged in the single row assigned to a QPU (see #VPM::getOrCreateStagingArea()).
+ */
+static bool canBeStagedInSingleRow(DataType type)
+{
+    if(auto arrayType = type.getArrayType())
+        return arrayType->size == 1 && canBeStagedInSingleRow(arrayType->elementType);
+    if(auto structType = type.getStructType())
+        return structType->elementTypes.size() == 1 && canBeStagedInSingleRow(structType->elementTypes.front());
+    if(type.getPointerType())
+        return true;
+    if(!type.isSimpleType())
+        return false;
+    return type.getScalarBitCount() <= 32;
+}
+
 InstructionWalker periphery::insertReadDMA(
     Method& method, InstructionWalker it, const Value& dest, const Value& addr, bool useMutex)
 {
+    // NOTE: In contrast to the DMA writes (see #insertWriteDMA()), reading into the VPM via DMA is still staged in the
+    // shared scratch area and therefore needs to be serialized via the hardware mutex. Staging the DMA reads in the
+    // per-QPU rows as well was tested and found to return wrong data for multiple consecutive reads from the same VPM
+    // row (e.g. for a __local array emulated in RAM), which is why only the (more expensive) DMA writes are optimized.
     if(useMutex)
     {
         // acquire mutex
@@ -339,23 +362,38 @@ InstructionWalker periphery::insertReadDMA(
 InstructionWalker periphery::insertWriteDMA(
     Method& method, InstructionWalker it, const Value& src, const Value& addr, bool useMutex)
 {
-    if(useMutex)
+    // Since every QPU stages its data in its own VPM row, the DMA accesses of different QPUs do not interfere with each
+    // other and therefore do not need to be serialized via the (global) hardware mutex.
+    const auto stagingArea = method.metaData.getMaximumInstancesCount() > 1 && canBeStagedInSingleRow(src.type) ?
+        method.vpm->getOrCreateStagingArea(method.metaData.getMaximumInstancesCount()) :
+        nullptr;
+    if(stagingArea == nullptr)
     {
-        // acquire mutex
-        it.emplace(std::make_unique<MutexLock>(MutexAccess::LOCK));
-        it.nextInBlock();
+        // fall-back to staging via the shared scratch area, which requires the mutex
+        if(useMutex)
+        {
+            // acquire mutex
+            it.emplace(std::make_unique<MutexLock>(MutexAccess::LOCK));
+            it.nextInBlock();
+        }
+
+        auto cacheEntry = std::make_shared<VPMCacheEntry>(method.vpm->getScratchArea(), src.type);
+        it = method.vpm->insertWriteVPM(method, it, src, cacheEntry);
+        it = method.vpm->insertWriteRAM(method, it, addr, cacheEntry);
+
+        if(useMutex)
+        {
+            // free mutex
+            it.emplace(std::make_unique<MutexLock>(MutexAccess::RELEASE));
+            it.nextInBlock();
+        }
+        return it;
     }
 
-    auto cacheEntry = std::make_shared<VPMCacheEntry>(method.vpm->getScratchArea(), src.type);
+    auto cacheEntry = std::make_shared<VPMCacheEntry>(*stagingArea, src.type);
+    cacheEntry->usePerQPURow = true;
     it = method.vpm->insertWriteVPM(method, it, src, cacheEntry);
     it = method.vpm->insertWriteRAM(method, it, addr, cacheEntry);
-
-    if(useMutex)
-    {
-        // free mutex
-        it.emplace(std::make_unique<MutexLock>(MutexAccess::RELEASE));
-        it.nextInBlock();
-    }
     return it;
 }
 
@@ -1063,6 +1101,8 @@ static std::string toUsageString(VPMUsage usage, const Local* local)
         return "register spilling";
     case VPMUsage::SCRATCH:
         return "scratch area";
+    case VPMUsage::DMA_STAGING:
+        return "DMA staging area";
     case VPMUsage::STACK:
         return "stack" + (local ? " " + local->to_string() : "");
     }
@@ -1193,6 +1233,31 @@ static Optional<uint32_t> findFreeVPMRows(const std::vector<std::shared_ptr<VPMA
             return static_cast<unsigned>(i);
     }
     return {};
+}
+
+const VPMArea* VPM::getOrCreateStagingArea(const unsigned numQPUs)
+{
+    if(stagingArea != nullptr)
+        return stagingArea;
+
+    // reserve one row per QPU, so every QPU can stage its DMA transfer without the need for the (global) hardware mutex
+    const auto numRows = static_cast<unsigned char>(std::min<unsigned>(std::max(numQPUs, 1u), VPM_NUM_ROWS));
+    Optional<unsigned> rowOffset = findFreeVPMRows(areas, numRows);
+    if(!rowOffset)
+        // no more (big enough) free space in the VPM
+        return nullptr;
+
+    auto ptr = std::make_shared<VPMArea>(VPMUsage::DMA_STAGING, static_cast<uint8_t>(rowOffset.value()), numRows,
+        TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE),
+        add_flag(VPMAreaAccessFlags::QPU_ACCESS_VECTOR_ALIGNED, VPMAreaAccessFlags::QPU_ACCESS_SINGLE_VECTOR));
+    for(auto i = rowOffset.value(); i < (rowOffset.value() + numRows); ++i)
+        areas[i] = ptr;
+    stagingArea = ptr.get();
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Allocating " << static_cast<unsigned>(numRows) << " rows of VPM DMA staging area starting at row "
+            << rowOffset.value() << " for " << numQPUs << " QPUs" << logging::endl);
+    PROFILE_COUNTER(vc4c::profiler::COUNTER_GENERAL, "VPM DMA staging rows", numRows);
+    return stagingArea;
 }
 
 const VPMArea* VPM::addSharedArea(const Local& baseAddress, const FastAccessList<MemoryAccessRange>& accessRanges)
@@ -1508,6 +1573,49 @@ void VPM::dumpUsage() const
 }
 LCOV_EXCL_STOP
 
+/*
+ * Returns the dynamic offset (in VPM rows) to the DMA staging row of the current QPU, if the given cache entry is
+ * located in the per-QPU DMA staging area.
+ *
+ * Returns an undefined value, if the cache entry must not be offset.
+ */
+static Value getStagingRowOffset(InstructionWalker& it, VPMCacheEntry& cacheEntry)
+{
+    if(!cacheEntry.usePerQPURow)
+        return UNDEFINED_VALUE;
+    if(cacheEntry.dynamicRowOffset.isUndefined())
+        // The QPU number register is located in register-file B, so it needs to be moved into a local first
+        cacheEntry.dynamicRowOffset = assign(it, TYPE_INT16, "%dma_staging_row") = Value(REG_QPU_NUMBER, TYPE_INT16);
+    return cacheEntry.dynamicRowOffset;
+}
+
+/*
+ * Returns the value to add to the setup-value of a QPU-side VPM access to address the given VPM row.
+ *
+ * The address of a QPU-side VPM access is not the row-index itself, but the row-index multiplied by the number of
+ * elements of the scalar type which fit into the 4-word granularity of a single QPU-side VPM access, e.g. x4 for
+ * byte-sized, x2 for half-word and x1 for word-sized elements.
+ */
+static Value getQPUSetupRowOffset(InstructionWalker& it, const Value& rowOffset, DataType scalarType)
+{
+    const auto scalarBitCount = std::min<uint8_t>(scalarType.getScalarBitCount(), 32);
+    const auto shift = static_cast<uint8_t>(scalarBitCount == 8 ? 2 : (scalarBitCount == 16 ? 1 : 0));
+    if(shift == 0)
+        return rowOffset;
+    return assign(it, rowOffset.type, "%vpm_row_offset") = rowOffset << Value(Literal(shift), TYPE_INT8);
+}
+
+/*
+ * Returns the value to add to the setup-value of a VPM DMA transfer to address the given VPM row.
+ *
+ * In contrast to the setup-value of a QPU-side access, the VPM address of the DMA setup is in X/Y coordinates, a row
+ * being 16 words wide, so the row offset needs to be shifted into the row-part of the address field.
+ */
+static Value getDMASetupRowOffset(InstructionWalker& it, const Value& rowOffset)
+{
+    return assign(it, rowOffset.type, "%vpm_dma_row_offset") = rowOffset << 7_val;
+}
+
 NODISCARD static InstructionWalker lowerReadVPM(
     Method& method, InstructionWalker it, const CacheAccessInstruction& access, const VPMCacheEntry& cacheEntry)
 {
@@ -1606,11 +1714,17 @@ NODISCARD static InstructionWalker lowerReadVPM(
 }
 
 NODISCARD static InstructionWalker lowerWriteVPM(
-    Method& method, InstructionWalker it, const CacheAccessInstruction& access, const VPMCacheEntry& cacheEntry)
+    Method& method, InstructionWalker it, const CacheAccessInstruction& access, VPMCacheEntry& cacheEntry)
 {
     // try to get constant offset value
     auto internalByteOffset = getSourceValue(cacheEntry.inAreaByteOffset);
     internalByteOffset = internalByteOffset.getConstantValue(true).value_or(internalByteOffset);
+
+    // the per-QPU row offset of the DMA staging area is only used for accesses without an offset within the area
+    const auto stagingRowOffset = getStagingRowOffset(it, cacheEntry);
+    if(!stagingRowOffset.isUndefined() && internalByteOffset != INT_ZERO)
+        throw CompilationError(CompilationStep::GENERAL,
+            "Cannot combine a per-QPU VPM row offset with an in-area byte offset", cacheEntry.to_string());
 
     // 1. configure writing from QPU into VPM
     const auto& dataType = cacheEntry.getVectorType();
@@ -1620,7 +1734,15 @@ NODISCARD static InstructionWalker lowerWriteVPM(
         if(access.upperWord)
             genericSetup.genericSetup.setWordRow(static_cast<uint8_t>(genericSetup.genericSetup.getWordRow() + 1u));
     }
-    if(internalByteOffset == INT_ZERO)
+    if(!stagingRowOffset.isUndefined())
+    {
+        // The data is staged in the VPM row of the current QPU, so the setup needs to be offset accordingly. Note that
+        // staging accesses never use an offset within the area (see check above).
+        assign(it, VPM_OUT_SETUP_REGISTER) = (Value(Literal(genericSetup.value), TYPE_INT32) +
+                                                 getQPUSetupRowOffset(it, stagingRowOffset, cacheEntry.getScalarType()),
+            InstructionDecorations::VPM_WRITE_CONFIGURATION);
+    }
+    else if(internalByteOffset == INT_ZERO)
         assign(it, VPM_OUT_SETUP_REGISTER) =
             (load(Literal(genericSetup.value)), InstructionDecorations::VPM_WRITE_CONFIGURATION);
     else if(!has_flag(cacheEntry.area.flags, VPMAreaAccessFlags::QPU_ACCESS_FULL_VECTOR) &&
@@ -1768,7 +1890,7 @@ NODISCARD static InstructionWalker lowerReadRAM(
 }
 
 NODISCARD static InstructionWalker lowerWriteRAM(
-    Method& method, InstructionWalker it, const RAMAccessInstruction& access, const VPMCacheEntry& cacheEntry)
+    Method& method, InstructionWalker it, const RAMAccessInstruction& access, VPMCacheEntry& cacheEntry)
 {
     // TODO is the calculation of the size to copy correct? We are mixing different types (e.g. byte from memory
     // instruction, consecutive memory area) with type for VPM area (rows which might not be filled completely). Same
@@ -1803,6 +1925,11 @@ NODISCARD static InstructionWalker lowerWriteRAM(
         dmaSetupBits = assign(it, TYPE_INT32, "%vpw_setup") =
             (dmaSetupBits + shiftedOffset, InstructionDecorations::VPM_WRITE_CONFIGURATION);
     }
+    // If the data is staged in the VPM row of the current QPU, the DMA setup needs to be offset to that row
+    const auto stagingRowOffset = getStagingRowOffset(it, cacheEntry);
+    if(!stagingRowOffset.isUndefined())
+        dmaSetupBits = assign(it, TYPE_INT32, "%vpw_setup") =
+            (dmaSetupBits + getDMASetupRowOffset(it, stagingRowOffset), InstructionDecorations::VPM_WRITE_CONFIGURATION);
     assign(it, VPM_OUT_SETUP_REGISTER) = (dmaSetupBits, InstructionDecorations::VPM_WRITE_CONFIGURATION);
 
     // set stride to zero
@@ -1822,7 +1949,7 @@ NODISCARD static InstructionWalker lowerWriteRAM(
 }
 
 static InstructionWalker lowerAccessRAM(
-    Method& method, InstructionWalker it, const RAMAccessInstruction& access, const VPMCacheEntry& cacheEntry)
+    Method& method, InstructionWalker it, const RAMAccessInstruction& access, VPMCacheEntry& cacheEntry)
 {
     if(access.op == MemoryOperation::READ)
         return lowerReadRAM(method, it, access, cacheEntry);
@@ -1833,7 +1960,7 @@ static InstructionWalker lowerAccessRAM(
 }
 
 static InstructionWalker lowerAccessCache(
-    Method& method, InstructionWalker it, const CacheAccessInstruction& access, const VPMCacheEntry& cacheEntry)
+    Method& method, InstructionWalker it, const CacheAccessInstruction& access, VPMCacheEntry& cacheEntry)
 {
     if(access.op == MemoryOperation::READ)
         return lowerReadVPM(method, it, access, cacheEntry);
