@@ -525,16 +525,26 @@ static void createVPMIODependencies(DependencyGraph& graph, DependencyNode& node
     const intermediate::IntermediateInstruction* lastVPMWrite, const intermediate::IntermediateInstruction* lastVPMRead)
 {
     if(lastVPMWrite != nullptr &&
-        (node.key->writesRegister(REG_VPM_IO) || node.key->writesRegister(REG_VPM_DMA_STORE_ADDR) ||
-            node.key->writesRegister(REG_MUTEX)))
+        (node.key->writesRegister(REG_VPM_IO) || node.key->writesRegister(REG_VPM_OUT_SETUP) ||
+            node.key->writesRegister(REG_VPM_DMA_STORE_ADDR) || node.key->writesRegister(REG_MUTEX)))
     {
-        // any other VPM write, VPM write address setup or unlocking mutex must be executed after the VPM write
+        // any other VPM write, VPM setup (which would change the configuration the write is executed with), VPM write
+        // address setup or unlocking mutex must be executed after the VPM write
         auto& otherNode = graph.assertNode(lastVPMWrite);
         addDependency(otherNode.getOrCreateEdge(&node).data, DependencyType::PERIPHERY_ORDER);
     }
-    if(lastVPMRead != nullptr && (node.key->readsRegister(REG_VPM_IO) || node.key->writesRegister(REG_MUTEX)))
+    // NOTE: Since the DMA staging accesses are not serialized by the mutex anymore, the ordering of the VPM accesses
+    // within a single QPU needs to be enforced by these register dependencies. Without the mutex lock, a following VPM
+    // setup, VPM write or DMA read (which also writes the VPM) could be re-ordered before the reading of the VPM data,
+    // changing the configuration or overwriting the data before it is read.
+    if(lastVPMRead != nullptr &&
+        (node.key->readsRegister(REG_VPM_IO) || node.key->writesRegister(REG_VPM_IO) ||
+            node.key->writesRegister(REG_VPM_IN_SETUP) || node.key->writesRegister(REG_VPM_DMA_LOAD_ADDR) ||
+            node.key->writesRegister(REG_MUTEX)))
     {
-        // any other VPM read or unlocking mutex must be executed after the VPM read
+        // any other VPM read, writing of the VPM, VPM setup (which would change the configuration the read is executed
+        // with), triggering of a DMA read into the VPM (which would overwrite the data to read) or unlocking mutex must
+        // be executed after the VPM read
         auto& otherNode = graph.assertNode(lastVPMRead);
         addDependency(otherNode.getOrCreateEdge(&node).data, DependencyType::PERIPHERY_ORDER);
     }
