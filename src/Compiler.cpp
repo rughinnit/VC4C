@@ -13,6 +13,7 @@
 #include "Precompiler.h"
 #include "Profiler.h"
 #include "ThreadPool.h"
+#include "analysis/WorkItemAnalysis.h"
 #include "asm/CodeGenerator.h"
 #include "log.h"
 #include "logger.h"
@@ -93,6 +94,50 @@ static std::unique_ptr<Parser> getParser(const CompilationData& source)
 
 CompilerInstance::CompilerInstance(const Configuration& config) : moduleConfig(config), module(moduleConfig) {}
 
+/*
+ * Returns the work-item merge factor requested via the environment, or 0 if merging is not requested.
+ *
+ * Only 16 is supported as merge factor, since exactly 16 work-items fit the 16 SIMD lanes of a QPU. Any other
+ * non-zero value is rejected (and merging stays disabled), so that a typo cannot silently produce wrong results.
+ */
+static uint8_t getWorkItemMergeFactorFromEnv()
+{
+    const char* value = std::getenv("VC4C_MERGE_WORK_ITEMS");
+    if(value == nullptr || *value == '\0')
+        return 0;
+    char* end = nullptr;
+    const unsigned long factor = std::strtoul(value, &end, 10);
+    if(end == value || *end != '\0' || (factor != 0 && factor != 1 && factor != NATIVE_VECTOR_SIZE))
+    {
+        CPPLOG_LAZY(logging::Level::WARNING,
+            log << "Ignoring invalid value '" << value << "' for VC4C_MERGE_WORK_ITEMS, only 16 is supported"
+                << logging::endl);
+        return 0;
+    }
+    return static_cast<uint8_t>(factor);
+}
+
+void CompilerInstance::applyWorkItemMerging()
+{
+    const auto factor = moduleConfig.workItemMergeFactor;
+    if(factor <= 1)
+        return;
+
+    for(auto* kernel : module.getKernels())
+    {
+        if(auto reason = analysis::checkWorkItemMerging(module, *kernel, factor))
+        {
+            CPPLOG_LAZY(logging::Level::WARNING,
+                log << "Not merging work-items for kernel '" << kernel->name << "': " << *reason << logging::endl);
+            continue;
+        }
+        kernel->metaData.mergedWorkItemsFactor = factor;
+        CPPLOG_LAZY(logging::Level::INFO,
+            log << "Merging " << static_cast<unsigned>(factor) << " work-items into one QPU execution for kernel '"
+                << kernel->name << "'" << logging::endl);
+    }
+}
+
 void CompilerInstance::precompileAndParseInput(const CompilationData& input, const std::string& options)
 {
     auto intermediate = Precompiler::precompile(input, moduleConfig, options);
@@ -116,7 +161,7 @@ void CompilerInstance::normalize(const std::set<std::string>& selectedSteps, boo
     normalization::Normalizer norm(moduleConfig);
 
     PROFILE_START(Normalizer);
-    norm.normalize(module, selectedSteps);
+    norm.normalize(module, selectedSteps, [this]() { applyWorkItemMerging(); });
     PROFILE_END(Normalizer);
 
     if(dropNonKernels)
@@ -212,7 +257,12 @@ std::pair<CompilationData, std::size_t> Compiler::compile(const CompilationData&
 {
     try
     {
-        CompilerInstance instance{config};
+        // allow enabling the work-item merging via the environment, e.g. for the VC4CL run-time which calls the
+        // compiler in-process
+        Configuration effectiveConfig{config};
+        if(effectiveConfig.workItemMergeFactor == 0)
+            effectiveConfig.workItemMergeFactor = getWorkItemMergeFactorFromEnv();
+        CompilerInstance instance{effectiveConfig};
 
         // pre-compilation
         instance.precompileAndParseInput(input, options);

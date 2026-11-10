@@ -206,6 +206,17 @@ namespace vc4c
          * Whether to stop compilation when instruction verification failed
          */
         bool stopWhenVerificationFailed = true;
+        /*
+         * The factor with which independent work-items are merged into a single QPU execution (one work-item per SIMD
+         * lane), or 0/1 to disable merging (the default).
+         *
+         * NOTE: This is only a request. The compiler checks every kernel-function and keeps the factor at 0/1 for
+         * kernels which cannot be executed with merged work-items (e.g. kernels using barriers or divergent control
+         * flow).
+         *
+         * This can also be set via the environment variable VC4C_MERGE_WORK_ITEMS (see Compiler::compile()).
+         */
+        uint8_t workItemMergeFactor = 0;
     };
 
     /*

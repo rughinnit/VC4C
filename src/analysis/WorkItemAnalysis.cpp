@@ -8,6 +8,7 @@
 
 #include "../Logger.h"
 #include "../Method.h"
+#include "../Module.h"
 #include "../Profiler.h"
 #include "../helper.h"
 #include "../intermediate/Helper.h"
@@ -418,6 +419,114 @@ static Optional<ActiveWorkItems> getWorkItemMask(
     CPPLOG_LAZY(logging::Level::DEBUG,
         log << "Unhandled case of work-item condition for '" << ::toString(condition) << "' and "
             << literalLimit.to_string() << ": " << comparison->to_string() << logging::endl);
+    return {};
+}
+
+static bool isWorkItemIdFunction(const std::string& name)
+{
+    return name == "vc4cl_local_id" || name == "vc4cl_global_id" || name == "vc4cl_local_linear_id" ||
+        name == "vc4cl_global_linear_id";
+}
+
+/*
+ * Finds the method called by the given call-site, mirroring the behavior of the inliner.
+ */
+static const Method* findCalledMethod(const Module& module, const intermediate::MethodCall& call)
+{
+    for(const auto& method : module.methods)
+    {
+        if(call.matchesSignature(*method, true /* exact match */))
+            return method.get();
+    }
+    for(const auto& method : module.methods)
+    {
+        if(call.matchesSignature(*method, false /* approximate match */))
+            return method.get();
+    }
+    return nullptr;
+}
+
+static void scanWorkItemUsage(const Module& module, const Method& method, FastSet<const Method*>& visited,
+    bool& usesIds, std::string& reason)
+{
+    if(!visited.emplace(&method).second)
+        return;
+
+    method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+        if(!reason.empty())
+            return;
+
+        // barriers are implemented via semaphores, which are indexed by the work-item. They cannot be expressed for
+        // 16 work-items running in parallel on the SIMD lanes of one QPU.
+        const auto signal = inst.getSignal();
+        if(signal == SIGNAL_SWITCH_THREAD || signal == SIGNAL_THREAD_SWITCH_LAST || signal == SIGNAL_END_PROGRAM ||
+            signal == SIGNAL_SOFT_BREAK)
+        {
+            reason = "contains a thread control signal";
+            return;
+        }
+
+        if(const auto* call = dynamic_cast<const intermediate::MethodCall*>(&inst))
+        {
+            if(call->methodName == "vc4cl_barrier")
+            {
+                reason = "contains a work-group barrier";
+                return;
+            }
+            if(isWorkItemIdFunction(call->methodName))
+            {
+                usesIds = true;
+                // the dimension of the ID cannot be checked, if it is not a constant (the value is a constant even if
+                // it was propagated through the temporarily created parameter of an inlined function)
+                const auto dimension = call->getArgument(0);
+                if((call->methodName == "vc4cl_local_id" || call->methodName == "vc4cl_global_id") &&
+                    !(dimension && dimension->getConstantValue(true) & &Value::getLiteralValue))
+                {
+                    reason = "reads a work-item ID with a non-constant dimension: " + call->to_string();
+                }
+                return;
+            }
+            if(const auto* calledMethod = findCalledMethod(module, *call))
+                scanWorkItemUsage(module, *calledMethod, visited, usesIds, reason);
+            return;
+        }
+
+        // Work-item-divergent control flow cannot be expressed as a masked store, since the VPM always writes a full
+        // row and the DMA copies a fixed depth. Be conservative and reject any conditional branch: for this first
+        // version there is no per-branch analysis of whether the condition actually depends on a work-item ID.
+        if(const auto* branch = dynamic_cast<const intermediate::Branch*>(&inst))
+        {
+            if(!branch->isUnconditional())
+                reason = "contains conditional branches (divergent control flow is not supported)";
+        }
+    });
+}
+
+Optional<std::string> analysis::checkWorkItemMerging(const Module& module, const Method& kernel, uint8_t factor)
+{
+    if(factor <= 1)
+        return std::string{"work-item merging is disabled"};
+
+    // the work-items are merged along dimension 0, so the number of work-items in that dimension must be a multiple
+    // of the number of SIMD lanes
+    if(kernel.metaData.getFixedWorkGroupSize())
+    {
+        const auto sizeX = kernel.metaData.workGroupSizes[0];
+        if(sizeX == 0u || sizeX % factor != 0u)
+            return std::string{"the required work-group size is not a multiple of the merge factor"};
+    }
+
+    FastSet<const Method*> visited;
+    bool usesIds = false;
+    std::string reason;
+    scanWorkItemUsage(module, kernel, visited, usesIds, reason);
+    if(!reason.empty())
+        return reason;
+    if(!usesIds)
+        // without reading any work-item ID, all work-items execute the same code. Merging them would execute the
+        // kernel only once per merged group and could change observable behavior (e.g. atomics, global counters).
+        return std::string{"does not read any work-item IDs"};
+
     return {};
 }
 

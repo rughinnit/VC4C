@@ -12,6 +12,7 @@
 #include "../Module.h"
 #include "../Profiler.h"
 #include "../ThreadPool.h"
+#include "../intermediate/VectorHelper.h"
 #include "../intrinsics/Intrinsics.h"
 #include "../optimization/ControlFlow.h"
 #include "../optimization/Eliminator.h"
@@ -269,7 +270,8 @@ static void runNormalizationStep(
     }
 }
 
-void Normalizer::normalize(Module& module, const std::set<std::string>& selectedSteps) const
+void Normalizer::normalize(Module& module, const std::set<std::string>& selectedSteps,
+    const std::function<void()>& afterInlining) const
 {
     // 1. eliminate phi on all methods
     for(auto& method : module)
@@ -299,6 +301,10 @@ void Normalizer::normalize(Module& module, const std::set<std::string>& selected
         PROFILE_END(Inline);
         PROFILE_COUNTER_WITH_PREV(vc4c::profiler::COUNTER_NORMALIZATION, "Inline (after)", kernel.countInstructions());
     }
+    if(afterInlining)
+        // e.g. to decide whether work-items can be merged, which needs to inspect the fully inlined kernel
+        afterInlining();
+
     // 3. run other normalization steps on kernel functions
     const auto f = [&, this](Method* kernelFunc) -> void { normalizeMethod(module, *kernelFunc, selectedSteps); };
     ThreadPool::scheduleAll<Method*>("Normalization", kernels, f, THREAD_LOGGER.get());
@@ -310,6 +316,118 @@ void Normalizer::adjust(Module& module, const std::set<std::string>& selectedSte
     auto kernels = module.getKernels();
     const auto f = [&, this](Method* kernelFunc) -> void { adjustMethod(module, *kernelFunc, selectedSteps); };
     ThreadPool::scheduleAll<Method*>("Adjustment", kernels, f, THREAD_LOGGER.get());
+}
+
+/*
+ * Propagates the SIMD vector width of the merged work-item IDs through the data flow.
+ *
+ * Reading a merged work-item ID yields one value per SIMD lane. All local values derived from it are per-lane too, but
+ * the intermediate code created from the source still declares them as scalars. The memory lowering derives the number
+ * of elements transferred per DMA access from the data type, so the derived values need to be declared as vectors,
+ * otherwise only a single element would be written per merged group.
+ */
+static void propagateMergedWorkItemTypes(Method& method)
+{
+    using namespace intermediate;
+
+    FastSet<const Local*> divergent;
+    // seed with the results of the work-item ID reads, which are emitted as SIMD vectors
+    method.forAllInstructions([&](const IntermediateInstruction& inst) {
+        if(!inst.hasDecoration(InstructionDecorations::BUILTIN_LOCAL_ID) &&
+            !inst.hasDecoration(InstructionDecorations::BUILTIN_GLOBAL_ID))
+            return;
+        if(auto out = inst.getOutput())
+        {
+            if(auto loc = out->checkLocal())
+            {
+                if(loc->type.getVectorWidth() > 1)
+                    divergent.emplace(loc);
+            }
+        }
+    });
+
+    const auto isDivergent = [&](const Value& val) -> bool {
+        auto loc = val.checkLocal();
+        return loc != nullptr && divergent.find(loc) != divergent.end();
+    };
+
+    // propagate the per-lane-ness to all values calculated from a per-lane value
+    bool changed = true;
+    while(changed)
+    {
+        changed = false;
+        method.forAllInstructions([&](const IntermediateInstruction& inst) {
+            // SIMD lane-crossing operations do not propagate the per-lane-ness, only the lane-parallel operations do
+            if(inst.getVectorRotation())
+                return;
+            const auto& args = inst.getArguments();
+            if(std::none_of(args.begin(), args.end(), isDivergent))
+                return;
+            auto out = inst.getOutput();
+            if(!out)
+                return;
+            auto loc = out->checkLocal();
+            if(loc != nullptr && divergent.emplace(loc).second)
+                changed = true;
+        });
+    }
+
+    std::size_t numVectorized = 0;
+    for(auto* loc : divergent)
+    {
+        if(!loc->type.isSimpleType() || loc->type.getVectorWidth() > 1)
+            continue;
+        if(loc->is<Parameter>() || loc->is<Global>() || loc->is<StackAllocation>() || loc->is<BuiltinLocal>())
+            continue;
+        const_cast<DataType&>(loc->type) = loc->type.toVectorType(NATIVE_VECTOR_SIZE);
+        ++numVectorized;
+    }
+    // the values stored in the instructions still carry the old (scalar) type, so update them as well. Otherwise the
+    // memory lowering would e.g. only write the first element of a per-lane value.
+    method.forAllInstructions([&](const IntermediateInstruction& inst) {
+        auto& args = const_cast<std::vector<Value>&>(inst.getArguments());
+        for(auto& arg : args)
+        {
+            auto loc = arg.checkLocal();
+            if(loc != nullptr && divergent.find(loc) != divergent.end() && arg.type.getVectorWidth() == 1 &&
+                loc->type.getVectorWidth() > 1)
+                arg.type = loc->type;
+        }
+        if(const auto& out = inst.getOutput())
+        {
+            auto loc = out->checkLocal();
+            if(loc != nullptr && divergent.find(loc) != divergent.end())
+            {
+                auto& value = const_cast<Value&>(out.value());
+                if(value.type.getVectorWidth() == 1 && loc->type.getVectorWidth() > 1)
+                    value.type = loc->type;
+            }
+        }
+    });
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Vectorized " << numVectorized << " values derived from merged work-item IDs" << logging::endl);
+
+    // stores of a lane-invariant value into a lane-dependent address still need to write all lanes
+    auto it = method.walkAllInstructions();
+    while(!it.isEndOfMethod())
+    {
+        if(!it.isEndOfBlock())
+        {
+            if(auto* mem = it.get<MemoryInstruction>())
+            {
+                if(mem->op == MemoryOperation::WRITE && isDivergent(mem->getDestination()) &&
+                    !isDivergent(mem->getSource()) && mem->getSource().type.isSimpleType() &&
+                    mem->getSource().type.getVectorWidth() == 1)
+                {
+                    const auto vectorType = mem->getSource().type.toVectorType(NATIVE_VECTOR_SIZE);
+                    const Value replicated = method.addNewLocal(vectorType, "%merged_store_value");
+                    it = insertReplication(it, mem->getSource(), replicated);
+                    mem->setArgument(0, replicated);
+                }
+            }
+        }
+        it.nextInMethod();
+    }
 }
 
 void Normalizer::normalizeMethod(Module& module, Method& method, const std::set<std::string>& selectedSteps) const
@@ -329,6 +447,13 @@ void Normalizer::normalizeMethod(Module& module, Method& method, const std::set<
         PROFILE_START_DYNAMIC(step.first);
         runNormalizationStep(step.second, module, method, config);
         PROFILE_END_DYNAMIC(step.first);
+    }
+
+    if(method.metaData.mergedWorkItemsFactor > 1 &&
+        (selectedSteps.empty() || selectedSteps.find("VectorizeMergedWorkItems") != selectedSteps.end()))
+    {
+        PROFILE_SCOPE(VectorizeMergedWorkItems);
+        propagateMergedWorkItemTypes(method);
     }
 
     // maps all memory-accessing instructions to intermediate memory access instructions.

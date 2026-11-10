@@ -1332,8 +1332,13 @@ static MemoryInfo canMapToDMAReadWrite(Method& method, const Local* baseAddr, Me
                         memoryInst->getDestinationElementType().getScalarBitCount() > 32 ||
                         memoryInst->getSourceElementType().getScalarBitCount() > 32);
             });
+    // For merged work-items, the memory addresses have a lane-dependent dynamic offset (one element per SIMD lane) on
+    // top of a per-work-group uniform base. The access range analysis only covers the elements of a single merged
+    // access, so caching the whole memory area in VPM would be wrong whenever the uniform base changes (e.g. in the
+    // work-group loop). Skip the VPM caching for such kernels, accessing RAM via VPM directly is still correct.
     if(access.ranges && !access.ranges->empty() && baseAddr->type.getPointerType() && isCacheableType &&
-        hasOnlyCacheableAccesses && (isLocalMemory || access.canBeCachedInVPM))
+        hasOnlyCacheableAccesses && (isLocalMemory || access.canBeCachedInVPM) &&
+        method.metaData.mergedWorkItemsFactor <= 1)
         area = checkCacheMemoryAccessRanges(method, baseAddr, *access.ranges, !isLocalMemory);
     if(area && isLocalMemory)
         // for local/private memory, there is no need for initial load/write-back
