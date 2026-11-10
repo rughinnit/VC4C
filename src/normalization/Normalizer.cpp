@@ -319,6 +319,38 @@ void Normalizer::adjust(Module& module, const std::set<std::string>& selectedSte
 }
 
 /*
+ * Makes the lane-invariant calculation of a lane-dependent value per-lane by replicating all its operands.
+ *
+ * This is only possible for values calculated element-wise from their operands (simple assignments and ALU
+ * operations). The check-work-item-merging analysis guarantees that no other instruction writes a lane-dependent value
+ * from lane-invariant operands, so the warning below is only a safety net.
+ */
+static void replicateLaneInvariantOperands(InstructionWalker it, Method& method)
+{
+    auto* inst = it.get();
+    if(it.get<intermediate::MoveOperation>() == nullptr && it.get<intermediate::Operation>() == nullptr)
+    {
+        CPPLOG_LAZY(logging::Level::WARNING,
+            log << "Cannot calculate lane-dependent value per work-item: " << it->to_string() << logging::endl);
+        return;
+    }
+    // NOTE: inserting instructions moves the walker to the inserted instruction, so remember the position of the
+    // instruction to modify and insert all replications directly in front of it
+    const auto position = it.copy();
+    for(std::size_t i = 0; i < inst->getArguments().size(); ++i)
+    {
+        const auto arg = inst->assertArgument(i);
+        if(!arg.type.isSimpleType() || arg.type.getVectorWidth() > 1)
+            // constants and already vectorized values are implicitly per-lane
+            continue;
+        const Value replicated = method.addNewLocal(arg.type.toVectorType(NATIVE_VECTOR_SIZE), "%merged_value");
+        auto insertionPoint = position.copy();
+        ignoreReturnValue(intermediate::insertReplication(insertionPoint, arg, replicated));
+        inst->setArgument(i, replicated);
+    }
+}
+
+/*
  * Propagates the SIMD vector width of the merged work-item IDs through the data flow.
  *
  * Reading a merged work-item ID yields one value per SIMD lane. All local values derived from it are per-lane too, but
@@ -425,6 +457,26 @@ static void propagateMergedWorkItemTypes(Method& method)
                     mem->setArgument(0, replicated);
                 }
             }
+        }
+        it.nextInMethod();
+    }
+
+    /*
+     * A value which is lane-dependent on one path must stay a per-lane value at a merge point (e.g. the value of a
+     * loop iteration or of a conditionally executed assignment), even if it is assigned a lane-invariant value on
+     * another path. Otherwise only the first SIMD lane would be written and the other lanes would keep a stale value.
+     */
+    it = method.walkAllInstructions();
+    while(!it.isEndOfMethod())
+    {
+        if(!it.isEndOfBlock())
+        {
+            auto out = it->getOutput();
+            auto loc = out ? out->checkLocal() : nullptr;
+            const auto& args = it->getArguments();
+            if(loc != nullptr && divergent.find(loc) != divergent.end() && loc->type.getVectorWidth() > 1 &&
+                std::none_of(args.begin(), args.end(), isDivergent))
+                replicateLaneInvariantOperands(it, method);
         }
         it.nextInMethod();
     }
