@@ -36,6 +36,15 @@ namespace vc4c
 
         void precompileAndParseInput(const CompilationData& input, const std::string& options = "");
         void parseInput(const CompilationData& input);
+        /**
+         * Enables the merging of independent work-items (one work-item per SIMD lane) for all kernel-functions which
+         * support it.
+         *
+         * This is called by the normalizer after inlining the called functions and before the other normalization
+         * steps, since it changes how the work-item built-ins are intrinsified and the check requires the fully
+         * inlined kernel.
+         */
+        void applyWorkItemMerging();
         void normalize(bool dropNonKernels = true);
         void normalize(const std::set<std::string>& selectedSteps, bool dropNonKernels = true);
         void optimize();

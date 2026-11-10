@@ -2454,8 +2454,11 @@ std::vector<MemoryAddress> tools::buildUniforms(Memory& memory, MemoryAddress ba
 
     for(uint32_t q = 0; q < numQPUs; ++q)
     {
-        std::array<Word, 3> localIDs = {q % config.localSizes[0], (q / config.localSizes[0]) % config.localSizes[1],
-            (q / config.localSizes[0]) / config.localSizes[1]};
+        // each QPU executes `workItemMergeFactor` consecutive work-items along dimension 0
+        const uint32_t localLinearIndex = q * workItemMergeFactor;
+        std::array<Word, 3> localIDs = {localLinearIndex % config.localSizes[0],
+            (localLinearIndex / config.localSizes[0]) % config.localSizes[1],
+            (localLinearIndex / config.localSizes[0]) / config.localSizes[1]};
 
         std::size_t i = 0;
         if(uniformsUsed.getWorkDimensionsUsed())
@@ -2463,7 +2466,9 @@ std::vector<MemoryAddress> tools::buildUniforms(Memory& memory, MemoryAddress ba
         if(uniformsUsed.getLocalSizesUsed())
             qpuUniforms[i++] = (config.localSizes[2] << 16) | (config.localSizes[1] << 8) | config.localSizes[0];
         if(uniformsUsed.getLocalIDsUsed())
-            qpuUniforms[i++] = (localIDs[2] << 16) | (localIDs[1] << 8) | (localIDs[0] * workItemMergeFactor);
+            // the ID of the first work-item executed by this QPU, the other merged work-items are executed by the
+            // SIMD lanes and add their lane index at run-time
+            qpuUniforms[i++] = (localIDs[2] << 16) | (localIDs[1] << 8) | localIDs[0];
         if(uniformsUsed.getNumGroupsXUsed())
             qpuUniforms[i++] = config.numGroups[0];
         if(uniformsUsed.getNumGroupsYUsed())
