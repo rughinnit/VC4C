@@ -235,8 +235,18 @@ struct VPMInstructions
 /**
  * Returns the instruction related to the current VPM access of the instruction given.
  *
- * This function looks within the same mutex-lock block (if any) at the preceding and following instructions to
- * find the instructions required for the given VPM access.
+ * This function looks at the preceding and following instructions to find the instructions required for the given VPM
+ * access.
+ *
+ * NOTE: Since the DMA staging accesses are not guarded by the mutex anymore, the search cannot be delimited by the
+ * mutex (un)lock instructions only. Instead, it is delimited by the VPM setup/address/wait registers, which are written
+ * by every VPM access:
+ * - Any write of a DMA address register (which triggers a VPM DMA transfer) belongs to another VPM access.
+ * - Any read of a DMA wait register either belongs to this access (if after the address write) or to a previous access
+ *   (if before it).
+ * - Mutex (un)locks still delimit the search, since the accesses guarded by them are serialized by the mutex.
+ *
+ * For the order of the instructions emitted for a single VPM access, see #lowerReadRAM() and #lowerWriteRAM().
  */
 static VPMInstructions findRelatedVPMInstructions(InstructionWalker anyVPMInstruction, bool isVPMRead)
 {
@@ -246,6 +256,12 @@ static VPMInstructions findRelatedVPMInstructions(InstructionWalker anyVPMInstru
         if(isVPMRead)
             return inst->writesRegister(REG_VPM_DMA_LOAD_ADDR);
         return inst->writesRegister(REG_VPM_DMA_STORE_ADDR);
+    };
+    const auto predAnyAddressWrite = [](const intermediate::IntermediateInstruction* inst) -> bool {
+        return inst->writesRegister(REG_VPM_DMA_LOAD_ADDR) || inst->writesRegister(REG_VPM_DMA_STORE_ADDR);
+    };
+    const auto predAnyDMAWait = [](const intermediate::IntermediateInstruction* inst) -> bool {
+        return inst->readsRegister(REG_VPM_DMA_LOAD_WAIT) || inst->readsRegister(REG_VPM_DMA_STORE_WAIT);
     };
     const auto predDMASetup = [isVPMRead](const intermediate::IntermediateInstruction* inst) -> bool {
         auto val = inst->precalculate().first & &Value::getLiteralValue;
@@ -283,54 +299,57 @@ static VPMInstructions findRelatedVPMInstructions(InstructionWalker anyVPMInstru
 
     VPMInstructions result;
 
-    // TODO could this select the wrong instructions for multiple VPM accesses within a single mutex-lock block?
-    // XXX are multiple VPM accesses within a mutex-lock even possible without combining the setups and addresses?
     auto it = anyVPMInstruction;
+    // the instruction passed in is (part of) the VPM access itself, e.g. its DMA address write
+    const auto collect = [&](InstructionWalker it) {
+        if(!result.addressWrite && predAddressWrite(it.get()))
+            result.addressWrite = it;
+        if(!result.dmaSetup && predDMASetup(it.get()))
+            result.dmaSetup = it;
+        if(!result.dmaWait && predDMAWait(it.get()))
+            result.dmaWait = it;
+        if(!result.genericVPMSetup && predGenericSetup(it.get()))
+            result.genericVPMSetup = it;
+        if(!result.strideSetup && predStrideSetup(it.get()))
+            result.strideSetup = it;
+        if(!result.vpmAccess && predVPMAccess(it.get()))
+            result.vpmAccess = it;
+    };
+    if(it.has())
+        collect(it);
+
     while(!it.isStartOfBlock())
     {
-        // only look up to the next mutex (un)lock
+        it.previousInBlock();
+        // mutex (un)locks still delimit the search, their accesses are serialized by the mutex
         if(it.get<intermediate::MutexLock>())
             break;
-        if(it.has())
-        {
-            if(!result.addressWrite && predAddressWrite(it.get()))
-                result.addressWrite = it;
-            if(!result.dmaSetup && predDMASetup(it.get()))
-                result.dmaSetup = it;
-            if(!result.dmaWait && predDMAWait(it.get()))
-                result.dmaWait = it;
-            if(!result.genericVPMSetup && predGenericSetup(it.get()))
-                result.genericVPMSetup = it;
-            if(!result.strideSetup && predStrideSetup(it.get()))
-                result.strideSetup = it;
-            if(!result.vpmAccess && predVPMAccess(it.get()))
-                result.vpmAccess = it;
-        }
-        it.previousInBlock();
+        if(!it.has())
+            continue;
+        // any other DMA address write or DMA wait delimits the instructions of this VPM access
+        if(predAnyAddressWrite(it.get()) || predAnyDMAWait(it.get()))
+            break;
+        collect(it);
     }
 
     it = anyVPMInstruction;
     while(!it.isEndOfBlock())
     {
-        // only look up to the next mutex (un)lock
+        it.nextInBlock();
+        if(it.isEndOfBlock())
+            break;
+        // mutex (un)locks still delimit the search, their accesses are serialized by the mutex
         if(it.get<intermediate::MutexLock>())
             break;
-        if(it.has())
-        {
-            if(!result.addressWrite && predAddressWrite(it.get()))
-                result.addressWrite = it;
-            if(!result.dmaSetup && predDMASetup(it.get()))
-                result.dmaSetup = it;
-            if(!result.dmaWait && predDMAWait(it.get()))
-                result.dmaWait = it;
-            if(!result.genericVPMSetup && predGenericSetup(it.get()))
-                result.genericVPMSetup = it;
-            if(!result.strideSetup && predStrideSetup(it.get()))
-                result.strideSetup = it;
-            if(!result.vpmAccess && predVPMAccess(it.get()))
-                result.vpmAccess = it;
-        }
-        it.nextInBlock();
+        if(!it.has())
+            continue;
+        // any other DMA address write delimits the instructions of this VPM access, the DMA wait is part of this access
+        if(predAnyAddressWrite(it.get()))
+            break;
+        if(predAnyDMAWait(it.get()) && result.dmaWait)
+            // this DMA wait belongs to another VPM access
+            break;
+        collect(it);
     }
 
     return result;

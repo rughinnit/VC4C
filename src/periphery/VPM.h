@@ -678,6 +678,17 @@ namespace vc4c
              */
             SCRATCH,
             /*
+             * This area is used to stage the DMA writes to RAM which are not guarded by the hardware mutex.
+             *
+             * NOTE:
+             * Since there is only a single hardware mutex shared by all QPUs, the mutex is only required, if all QPUs
+             * stage their data in the same VPM rows. By assigning a separate row to every QPU, these transfers do not
+             * need to be serialized at all.
+             *
+             * Its size needs to include one row for every QPU.
+             */
+            DMA_STAGING,
+            /*
              * This area is used as storage for local memory areas which fit into VPM.
              */
             LOCAL_MEMORY,
@@ -747,6 +758,18 @@ namespace vc4c
             // NOTE: This usage is not tracked, so any optimization removing unread local MUST not be run yet as long as
             // this cache entry is not lowered!
             Value inAreaByteOffset;
+            /*
+             * An additional, dynamically calculated offset (in rows of VPM) into the area this cache entry points to.
+             *
+             * This is used for the DMA staging area to give every QPU its own row, so the accesses of different QPUs do
+             * not interfere with each other and therefore do not need to be serialized via the hardware mutex.
+             */
+            Value dynamicRowOffset = UNDEFINED_VALUE;
+            /*
+             * Whether this cache entry is located in the per-QPU DMA staging area and therefore needs to be offset to the
+             * VPM row of the current QPU.
+             */
+            bool usePerQPURow = false;
 
         private:
             DataType elementType;
@@ -880,6 +903,13 @@ namespace vc4c
             explicit VPM(unsigned totalVPMSize = VPM_DEFAULT_SIZE);
 
             const VPMArea& getScratchArea() const;
+            /*
+             * Returns (and if necessary, allocates) the area of the VPM used to stage the DMA transfers between the QPUs
+             * and RAM, with one row reserved for every QPU.
+             *
+             * Returns nullptr, if there is not enough free space left in the VPM to reserve the rows.
+             */
+            const VPMArea* getOrCreateStagingArea(unsigned numQPUs);
             const VPMArea* findArea(const Local* local);
             const VPMArea* addSharedArea(
                 const Local& baseAddress, const FastAccessList<analysis::MemoryAccessRange>& accessRanges);
@@ -953,6 +983,8 @@ namespace vc4c
         private:
             const unsigned maximumVPMSize;
             std::vector<std::shared_ptr<VPMArea>> areas;
+            // the (optional) area used to stage DMA transfers, see #getOrCreateStagingArea()
+            const VPMArea* stagingArea = nullptr;
 
             InstructionWalker insertLockMutex(InstructionWalker it, bool useMutex) const;
             InstructionWalker insertUnlockMutex(InstructionWalker it, bool useMutex) const;
