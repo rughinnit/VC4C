@@ -492,8 +492,9 @@ static void scanWorkItemUsage(const Module& module, const Method& method, FastSe
         }
 
         // Work-item-divergent control flow cannot be expressed as a masked store, since the VPM always writes a full
-        // row and the DMA copies a fixed depth. Be conservative and reject any conditional branch: for this first
-        // version there is no per-branch analysis of whether the condition actually depends on a work-item ID.
+        // row and the DMA copies a fixed depth. Be conservative and reject any conditional branch: even though a
+        // branch on a lane-uniform condition could in principle be executed by all merged work-items, the values
+        // flowing through such a branch cannot be verified to stay per-lane (see #checkLaneDependentMemoryAccesses).
         if(const auto* branch = dynamic_cast<const intermediate::Branch*>(&inst))
         {
             if(!branch->isUnconditional())
@@ -501,6 +502,372 @@ static void scanWorkItemUsage(const Module& module, const Method& method, FastSe
         }
     });
 }
+
+namespace
+{
+    /*
+     * The change of a value from one merged work-item to the next one (i.e. from one SIMD lane to the following):
+     *
+     * - "known" with a step of 0 means that all merged work-items calculate the same value
+     * - "known" with a non-zero step means the value is a linear function of the work-item ID, e.g. 4 for the byte
+     *   address of consecutive elements of a float array
+     * - unknown means the value can differ between the merged work-items, but not in a known linear way
+     */
+    struct LaneStep
+    {
+        bool known;
+        int64_t step;
+
+        static LaneStep uniform()
+        {
+            return LaneStep{true, 0};
+        }
+
+        bool isUniform() const noexcept
+        {
+            return known && step == 0;
+        }
+    };
+
+    /*
+     * The arithmetic operations for which the lane step can be calculated
+     */
+    enum class LaneOp
+    {
+        ADD,
+        SUB,
+        MUL,
+        SHL
+    };
+
+    /*
+     * Determines how the values of a kernel-function change from one merged work-item to the next.
+     *
+     * NOTE: This must be run on the kernel-function after inlining, since only then all the data dependencies (also of
+     * the inlined functions) are visible.
+     */
+    class LaneStepAnalysis
+    {
+    public:
+        LaneStep getStep(const Value& value)
+        {
+            if(value.getConstantValue(true))
+                // literals are identical for all merged work-items
+                return LaneStep::uniform();
+
+            auto local = value.checkLocal();
+            if(local == nullptr)
+                // e.g. registers like the element number, which is handled where it is read
+                return LaneStep::uniform();
+
+            auto it = results.find(local);
+            if(it != results.end())
+                return it->second;
+
+            if(!pending.emplace(local).second)
+                // circular dependency, assume the worst
+                return LaneStep{false, 0};
+
+            auto result = determineStep(*local);
+            pending.erase(local);
+            results.emplace(local, result);
+            return result;
+        }
+
+    private:
+        FastMap<const Local*, LaneStep> results;
+        FastSet<const Local*> pending;
+
+        static LaneStep scale(const LaneStep& step, int64_t factor)
+        {
+            return step.known ? LaneStep{true, step.step * factor} : step;
+        }
+
+        LaneStep determineStep(const Local& local)
+        {
+            if(local.is<Parameter>() || local.type == TYPE_LABEL)
+                // kernel-function arguments (and labels) are identical for all merged work-items
+                return LaneStep::uniform();
+
+            bool hasWriter = false;
+            LaneStep result = LaneStep::uniform();
+            local.forUsers(LocalUse::Type::WRITER, [&](const LocalUser* writer) {
+                if(const auto* mem = dynamic_cast<const intermediate::MemoryInstruction*>(writer))
+                {
+                    if(mem->op != intermediate::MemoryOperation::READ)
+                        // the "output" of a memory write is only the address it accesses, not a newly calculated
+                        // value
+                        return;
+                }
+                auto writerStep = determineInstructionStep(*writer);
+                if(!hasWriter)
+                    result = writerStep;
+                else if(!writerStep.known || !result.known || writerStep.step != result.step)
+                    // multiple definitions with different (or unknown) steps, e.g. at a merge point
+                    result = LaneStep{false, 0};
+                hasWriter = true;
+            });
+            if(!hasWriter)
+                // e.g. references to built-in locals, which are uniform for the whole work-group
+                return LaneStep::uniform();
+            return result;
+        }
+
+        LaneStep determineInstructionStep(const intermediate::IntermediateInstruction& inst)
+        {
+            if(inst.readsRegister(REG_ELEMENT_NUMBER))
+                // the element number is the index of the SIMD lane, which increments by one per merged work-item
+                return LaneStep{true, 1};
+
+            if(const auto* call = dynamic_cast<const intermediate::MethodCall*>(&inst))
+            {
+                if(isWorkItemIdFunction(call->methodName))
+                {
+                    // the merged work-items are consecutive along dimension 0, so only the ID of that dimension is
+                    // mapped to the SIMD lanes. The IDs of the other dimensions - and all sizes and group IDs - are
+                    // identical for all merged work-items.
+                    const auto dimension = call->getArgument(0);
+                    if(!dimension)
+                        return LaneStep{false, 0};
+                    const auto literal = dimension->getConstantValue(true);
+                    if(!literal)
+                        return LaneStep{false, 0};
+                    const auto literalValue = literal->getLiteralValue();
+                    if(!literalValue)
+                        return LaneStep{false, 0};
+                    return LaneStep{true, literalValue->unsignedInt() == 0u ? 1 : 0};
+                }
+                // any other call (e.g. a built-in read of a lane-uniform size) is only uniform if all its arguments are
+                return argumentsStep(inst);
+            }
+
+            if(const auto* mem = dynamic_cast<const intermediate::MemoryInstruction*>(&inst))
+            {
+                if(mem->op == intermediate::MemoryOperation::READ)
+                    // reading from a lane-uniform address gives the same value for all merged work-items, the value
+                    // read from a per-work-item address can be anything
+                    return getStep(mem->getSource()).isUniform() ? LaneStep::uniform() : LaneStep{false, 0};
+                return LaneStep{false, 0};
+            }
+
+            if(const auto* move = dynamic_cast<const intermediate::MoveOperation*>(&inst))
+                // simple copies keep the step of their source
+                return getStep(move->getSource());
+
+            if(const auto* operation = dynamic_cast<const intermediate::Operation*>(&inst))
+            {
+                if(operation->op == OP_ADD)
+                    return binaryStep(inst, LaneOp::ADD);
+                if(operation->op == OP_SUB)
+                    return binaryStep(inst, LaneOp::SUB);
+                if(operation->op == OP_SHL)
+                    return binaryStep(inst, LaneOp::SHL);
+                return argumentsStep(inst);
+            }
+            if(const auto* intrinsic = dynamic_cast<const intermediate::IntrinsicOperation*>(&inst))
+            {
+                if(intrinsic->opCode == "add")
+                    return binaryStep(inst, LaneOp::ADD);
+                if(intrinsic->opCode == "sub")
+                    return binaryStep(inst, LaneOp::SUB);
+                if(intrinsic->opCode == "mul")
+                    return binaryStep(inst, LaneOp::MUL);
+                if(intrinsic->opCode == "shl")
+                    return binaryStep(inst, LaneOp::SHL);
+            }
+
+            return argumentsStep(inst);
+        }
+
+        /*
+         * Fall-back for all other instructions: only exactly reproducible argument values give a reproducible result.
+         */
+        LaneStep argumentsStep(const intermediate::IntermediateInstruction& inst)
+        {
+            for(const auto& arg : inst.getArguments())
+            {
+                if(!getStep(arg).isUniform())
+                    return LaneStep{false, 0};
+            }
+            return LaneStep::uniform();
+        }
+
+        LaneStep binaryStep(const intermediate::IntermediateInstruction& inst, LaneOp laneOp)
+        {
+            const auto& args = inst.getArguments();
+            if(args.size() != 2)
+                return argumentsStep(inst);
+            const auto step0 = getStep(args[0]);
+            const auto step1 = getStep(args[1]);
+
+            if(laneOp == LaneOp::ADD || laneOp == LaneOp::SUB)
+            {
+                if(!step0.known || !step1.known)
+                    return LaneStep{false, 0};
+                return LaneStep{true, laneOp == LaneOp::ADD ? step0.step + step1.step : step0.step - step1.step};
+            }
+            if(laneOp == LaneOp::MUL)
+            {
+                if(!step0.known || !step1.known)
+                    return LaneStep{false, 0};
+                // a lane-dependent value multiplied by a constant keeps its step, only scaled by the constant
+                if(auto literal = args[0].getLiteralValue())
+                    return scale(step1, literal->signedInt());
+                if(auto literal = args[1].getLiteralValue())
+                    return scale(step0, literal->signedInt());
+                if(step0.step == 0 && step1.step == 0)
+                    return LaneStep::uniform();
+                // multiplying by a lane-uniform value which is not a constant gives an unknown step
+                return LaneStep{false, 0};
+            }
+            if(laneOp == LaneOp::SHL)
+            {
+                if(step0.isUniform())
+                    return LaneStep::uniform();
+                if(!step0.known)
+                    return LaneStep{false, 0};
+                if(auto literal = args[1].getLiteralValue())
+                    return LaneStep{true, step0.step * static_cast<int64_t>(1ull << (literal->unsignedInt() & 63u))};
+                return LaneStep{false, 0};
+            }
+            return argumentsStep(inst);
+        }
+    };
+
+    /*
+     * Determines the size (in bytes) of the single elements accessed by the given memory instruction.
+     */
+    static int64_t getAccessedElementBytes(const intermediate::MemoryInstruction& mem)
+    {
+        const auto elementType = mem.op == intermediate::MemoryOperation::WRITE ? mem.getDestinationElementType() :
+                                                                                 mem.getSourceElementType();
+        if(!elementType.isSimpleType())
+            return 0;
+        const auto bitWidth = static_cast<int64_t>(elementType.getScalarBitCount()) *
+            static_cast<int64_t>(elementType.getVectorWidth());
+        return bitWidth > 0 ? bitWidth / 8 : 0;
+    }
+
+    /*
+     * The memory lowering always transfers a single contiguous block of elements starting at the address calculated
+     * for the first work-item of the merged group (the work-items are consecutive along dimension 0, so this is the
+     * first SIMD lane). Thus, a memory access at a lane-dependent address is only correct if the address advances by
+     * exactly one accessed element per work-item. Anything else (strided accesses, gathers, ...) cannot be expressed
+     * by the hardware and would silently read/write the wrong elements.
+     */
+    static std::string checkLaneDependentMemoryAccesses(const Method& method, LaneStepAnalysis& laneSteps)
+    {
+        std::string reason;
+        method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+            if(!reason.empty())
+                return;
+            const auto* mem = dynamic_cast<const intermediate::MemoryInstruction*>(&inst);
+            if(mem == nullptr)
+                return;
+
+            const bool isWrite = mem->op == intermediate::MemoryOperation::WRITE;
+            const auto& address = isWrite ? mem->getDestination() : mem->getSource();
+            const auto addressStep = laneSteps.getStep(address);
+            if(mem->op == intermediate::MemoryOperation::COPY || mem->op == intermediate::MemoryOperation::FILL)
+            {
+                // a memory copy/fill only has one address for all merged work-items
+                if(!addressStep.isUniform() || !laneSteps.getStep(mem->getSource()).isUniform())
+                    reason = "copies memory at a lane-dependent address: " + mem->to_string();
+                return;
+            }
+
+            if(addressStep.isUniform())
+            {
+                // all merged work-items access the same address. For a read, the value is simply replicated. For a
+                // write, a lane-dependent value cannot be represented, since there is only one element to write.
+                if(isWrite && !laneSteps.getStep(mem->getSource()).isUniform())
+                    reason = "writes a lane-dependent value to a lane-independent address: " + mem->to_string();
+                return;
+            }
+
+            const auto elementBytes = getAccessedElementBytes(*mem);
+            if(!addressStep.known || elementBytes <= 0 || addressStep.step != elementBytes)
+            {
+                reason = "accesses memory at a lane-dependent address which does not advance by exactly one element "
+                         "per work-item: " +
+                    mem->to_string();
+            }
+        });
+        return reason;
+    }
+
+    /*
+     * Verifies that all lane-dependent values are only used in ways the normalizer can express per work-item, i.e.
+     * that the vector width of a lane-dependent value can be propagated to its uses. If this cannot be proven, the
+     * kernel must not be merged, since the normalizer would emit a scalar use of a per-lane value.
+     */
+    static std::string checkLaneDependentValueUses(const Method& method, LaneStepAnalysis& laneSteps)
+    {
+        std::string reason;
+        method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+            if(!reason.empty())
+                return;
+            if(dynamic_cast<const intermediate::MemoryInstruction*>(&inst) != nullptr)
+                // handled by #checkLaneDependentMemoryAccesses
+                return;
+
+            bool usesLaneDependent = false;
+            for(const auto& arg : inst.getArguments())
+            {
+                if(!laneSteps.getStep(arg).isUniform())
+                {
+                    usesLaneDependent = true;
+                    break;
+                }
+            }
+            if(!usesLaneDependent)
+                return;
+
+            auto out = inst.getOutput();
+            if(!out || out->checkLocal() == nullptr)
+            {
+                reason = "uses a lane-dependent value in a way which cannot be expressed per work-item: " +
+                    inst.to_string();
+                return;
+            }
+            if(out->checkLocal()->type == TYPE_BOOL)
+                // the vector width propagation does not handle boolean values
+                reason = "calculates a lane-dependent boolean value: " + inst.to_string();
+        });
+        return reason;
+    }
+
+    /*
+     * The vector width propagation makes every lane-dependent value a 16-element vector, i.e. it assumes one 32-bit
+     * element per SIMD lane. Values of a vector type (e.g. a per-work-item float2) or of a 64-bit type would require a
+     * different layout, so kernels calculating such values cannot be merged.
+     */
+    static std::string checkLaneDependentValueTypes(const Method& method, LaneStepAnalysis& laneSteps)
+    {
+        std::string reason;
+        const auto check = [&](const Value& value, const std::string& instruction) {
+            if(!reason.empty())
+                return;
+            auto local = value.checkLocal();
+            if(local == nullptr || !local->type.isSimpleType())
+                return;
+            if(laneSteps.getStep(value).isUniform())
+                return;
+            if(local->type.getVectorWidth() > 1 || local->type.getScalarBitCount() > 32)
+                reason = "calculates a lane-dependent value of more than one 32-bit element: " + instruction;
+        };
+        method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+            if(!reason.empty())
+                return;
+            for(const auto& arg : inst.getArguments())
+                check(arg, inst.to_string());
+            auto out = inst.getOutput();
+            if(out)
+                check(*out, inst.to_string());
+        });
+        return reason;
+    }
+} // namespace
 
 Optional<std::string> analysis::checkWorkItemMerging(const Module& module, const Method& kernel, uint8_t factor)
 {
@@ -526,6 +893,17 @@ Optional<std::string> analysis::checkWorkItemMerging(const Module& module, const
         // without reading any work-item ID, all work-items execute the same code. Merging them would execute the
         // kernel only once per merged group and could change observable behavior (e.g. atomics, global counters).
         return std::string{"does not read any work-item IDs"};
+
+    LaneStepAnalysis laneSteps;
+    auto memoryReason = checkLaneDependentMemoryAccesses(kernel, laneSteps);
+    if(!memoryReason.empty())
+        return memoryReason;
+    auto useReason = checkLaneDependentValueUses(kernel, laneSteps);
+    if(!useReason.empty())
+        return useReason;
+    auto typeReason = checkLaneDependentValueTypes(kernel, laneSteps);
+    if(!typeReason.empty())
+        return typeReason;
 
     return {};
 }
