@@ -183,6 +183,39 @@ static NODISCARD InstructionWalker intrinsifyReadLocalSize(Method& method, Instr
     return intrinsifyReadWorkItemInfo(method, it, arg, BuiltinLocal::Type::LOCAL_SIZES, decorations);
 }
 
+/*
+ * Lowers reading the local ID of dimension 0 to a per-lane value, if multiple work-items are merged into one QPU
+ * execution: the UNIFORM contains the ID of the first work-item of the merged group, the ID of the work-item executed
+ * by a single SIMD lane is that base ID plus the lane index (= element number).
+ */
+static NODISCARD InstructionWalker intrinsifyReadMergedLocalIDX(Method& method, InstructionWalker it)
+{
+    Value out = it->getOutput().value();
+    const Local* itemInfo = method.findOrCreateBuiltin(BuiltinLocal::Type::LOCAL_IDS);
+    const auto decorations = BuiltinLocal::getDecorations(BuiltinLocal::Type::LOCAL_IDS);
+
+    // 1. read the work-group-uniform base ID of dimension X
+    const Value base = method.addNewLocal(TYPE_INT8, "%local_id_base");
+    it.reset(createWithExtras<MoveOperation>(*it.get(), base, itemInfo->createReference()))
+        .setUnpackMode(UNPACK_8A_32)
+        .addDecorations(decorations)
+        .addDecorations(InstructionDecorations::DIMENSION_X);
+    // the result of this built-in is per-lane now
+    const auto vectorType = TYPE_INT8.toVectorType(NATIVE_VECTOR_SIZE);
+    const_cast<DataType&>(out.local()->type) = vectorType;
+    out.type = vectorType;
+    it.nextInBlock();
+
+    // 2. replicate the base ID across all SIMD lanes
+    const Value replicated = method.addNewLocal(TYPE_INT8.toVectorType(NATIVE_VECTOR_SIZE), "%local_id_lanes");
+    it = insertReplication(it, base, replicated);
+
+    // 3. add the lane index to the base ID
+    assign(it, out) = (replicated + ELEMENT_NUMBER_REGISTER, decorations, InstructionDecorations::DIMENSION_X,
+        InstructionDecorations::UNSIGNED_RESULT);
+    return it.previousInBlock();
+}
+
 static NODISCARD InstructionWalker intrinsifyReadLocalID(Method& method, InstructionWalker it, const Value& arg)
 {
     if(method.metaData.getFixedWorkGroupSize() == 1u)
@@ -195,6 +228,13 @@ static NODISCARD InstructionWalker intrinsifyReadLocalID(Method& method, Instruc
             .addDecorations(dimension);
         return it;
     }
+    // NOTE: the dimension may be a constant propagated through the temporarily created parameter of an inlined
+    // function, so resolve it instead of only checking for literals
+    const auto dimension = arg.getConstantValue(true) & &Value::getLiteralValue;
+    if(method.metaData.mergedWorkItemsFactor > 1 && dimension && dimension->unsignedInt() == 0u)
+        // with merged work-items, only dimension 0 is mapped to the SIMD lanes. The other dimensions are identical for
+        // all work-items of a merged group and can stay scalar.
+        return intrinsifyReadMergedLocalIDX(method, it);
     return intrinsifyReadWorkItemInfo(
         method, it, arg, BuiltinLocal::Type::LOCAL_IDS, BuiltinLocal::getDecorations(BuiltinLocal::Type::LOCAL_IDS));
 }

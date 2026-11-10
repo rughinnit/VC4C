@@ -16,9 +16,22 @@ namespace vc4c
 {
     class BasicBlock;
     class Method;
+    class Module;
 
     namespace analysis
     {
+        /**
+         * Checks whether the given kernel-function can be executed with multiple work-items merged into a single QPU
+         * execution (one work-item per SIMD lane along dimension 0).
+         *
+         * Returns an empty optional if merging is supported, otherwise the reason why it is not.
+         *
+         * NOTE: This check must be run on the intermediate code after the called functions have been inlined and
+         * before the other normalization steps, since it relies on the calls to the work-item built-ins (which are
+         * intrinsified by the normalization) with their actual (constant or dynamic) dimension arguments.
+         */
+        Optional<std::string> checkWorkItemMerging(const Module& module, const Method& kernel, uint8_t factor);
+
         class ControlFlowGraph;
 
         enum class WorkItemCondition

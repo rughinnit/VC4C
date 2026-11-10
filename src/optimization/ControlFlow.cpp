@@ -970,6 +970,16 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
 {
     if(method.walkAllInstructions().isEndOfMethod())
         return 0u;
+    if(method.metaData.mergedWorkItemsFactor > 1)
+    {
+        // The work-group loop synchronizes the work-items of the work-group between two loop iterations via semaphores,
+        // which are indexed by the work-item and therefore cannot be used with 16 merged work-items per QPU. Without
+        // the loop, every work-group is launched separately by the run-time (which still runs 16 work-items in
+        // parallel), so the cross-work-group ordering is guaranteed.
+        CPPLOG_LAZY(logging::Level::WARNING,
+            log << "Skipping work-group loop for kernel with merged work-items: " << method.name << logging::endl);
+        return 0u;
+    }
     CPPLOG_LAZY(
         logging::Level::DEBUG, log << "Wrapping kernel " << method.name << " in a work-group loop..." << logging::endl);
 

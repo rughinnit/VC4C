@@ -47,7 +47,8 @@ namespace vc4c
              *
              * NOTE: The normalization needs to be run BEFORE the optimizations
              */
-            void normalize(Module& module, const std::set<std::string>& selectedSteps = {}) const;
+            void normalize(Module& module, const std::set<std::string>& selectedSteps = {},
+                const std::function<void()>& afterInlining = {}) const;
 
             /*
              * Runs the second batch of normalization steps, trying to fix any possible issues with hardware limitations
