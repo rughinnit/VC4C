@@ -1274,7 +1274,13 @@ static MemoryInfo canLowerToSharedVPMArea(Method& method, const Local* baseAddr,
     auto contentType = baseAddr->type.getElementType();
     bool hasStructContent =
         contentType.getStructType() || (contentType.getArrayType() && contentType.getElementType().getStructType());
-    if(!hasStructContent)
+    // A __local buffer is shared by all work-items of the work-group, i.e. also by the work-items merged into different
+    // QPUs. The VPM areas are per-QPU, while the accesses of a merged group use a lane-dependent offset spanning the
+    // whole buffer (mergeFactor consecutive elements per access), so such a buffer must not be kept in VPM. It is kept
+    // in RAM and accessed via VPM instead (see #canMapToDMAReadWrite()).
+    const bool isLocalBuffer = baseAddr->type.getPointerType() && !baseAddr->is<StackAllocation>() &&
+        baseAddr->type.getPointerType()->addressSpace == AddressSpace::LOCAL;
+    if(!hasStructContent && !(method.metaData.mergedWorkItemsFactor > 1 && isLocalBuffer))
     {
         if(!access.ranges)
             access.ranges = analysis::determineAccessRanges(method, baseAddr, access.accessInstructions);

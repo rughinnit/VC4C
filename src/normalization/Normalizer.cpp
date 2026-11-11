@@ -340,7 +340,7 @@ static void replicateLaneInvariantOperands(InstructionWalker it, Method& method)
     for(std::size_t i = 0; i < inst->getArguments().size(); ++i)
     {
         const auto arg = inst->assertArgument(i);
-        if(!arg.type.isSimpleType() || arg.type.getVectorWidth() > 1)
+        if(arg.getConstantValue(true) || !arg.type.isSimpleType() || arg.type.getVectorWidth() > 1)
             // constants and already vectorized values are implicitly per-lane
             continue;
         const Value replicated = method.addNewLocal(arg.type.toVectorType(NATIVE_VECTOR_SIZE), "%merged_value");
@@ -483,6 +483,11 @@ static void propagateMergedWorkItemTypes(Method& method)
      * A value which is lane-dependent on one path must stay a per-lane value at a merge point (e.g. the value of a
      * loop iteration or of a conditionally executed assignment), even if it is assigned a lane-invariant value on
      * another path. Otherwise only the first SIMD lane would be written and the other lanes would keep a stale value.
+     *
+     * The same applies to the lane-invariant operands of an instruction which already has a lane-dependent operand:
+     * a register always holds one value per SIMD lane, so a lane-invariant value used together with a per-lane value
+     * must be replicated to all lanes as well. This e.g. covers the very common case of a value read from a
+     * work-group-uniform (e.g. __local) address being combined with a per-work-item value.
      */
     it = method.walkAllInstructions();
     while(!it.isEndOfMethod())
@@ -491,9 +496,7 @@ static void propagateMergedWorkItemTypes(Method& method)
         {
             auto out = it->getOutput();
             auto loc = out ? out->checkLocal() : nullptr;
-            const auto& args = it->getArguments();
-            if(loc != nullptr && divergent.find(loc) != divergent.end() && loc->type.getVectorWidth() > 1 &&
-                std::none_of(args.begin(), args.end(), isDivergent))
+            if(loc != nullptr && divergent.find(loc) != divergent.end() && loc->type.getVectorWidth() > 1)
                 replicateLaneInvariantOperands(it, method);
         }
         it.nextInMethod();
