@@ -26,7 +26,7 @@ TMUCacheEntry::TMUCacheEntry(const TMU& tmu, const Value& addr, DataType origina
     index(tmuCacheEntryCounter++), tmu(tmu), addresses(addr),
     numVectorElements(Value(Literal(originalType.getPointerType() ? 1 : originalType.getVectorWidth()), TYPE_INT8)),
     elementStrideInBytes(originalType.getScalarBitCount() / 8), customAddressCalculation(false),
-    perLaneAddresses(false)
+    perLaneAddresses(false), laneUniformAddress(false)
 {
     if(!originalType.isSimpleType() && !originalType.getPointerType())
         throw CompilationError(
@@ -104,6 +104,9 @@ static NODISCARD InstructionWalker insertCalculateAddressOffsets(Method& method,
         // single TMU cache miss.
         // To guarantee that we actually load the same address (and not some random value which happened to be in the
         // address register), we also use the replicated address for the scalar loads.
+        // This is also the way a read at a lane-uniform address is broadcast: the destination may be a per-lane value
+        // with 16 elements, but only the single (identical) address is loaded, and the value read for the first lane
+        // is the value of all lanes.
         assign(it, outputAddress) = (replicatedAddress, intermediate::InstructionDecorations::UNSIGNED_RESULT);
         return it;
     }
@@ -291,7 +294,8 @@ static NODISCARD InstructionWalker insertReadLongVectorFromTMU(
 }
 
 InstructionWalker periphery::insertReadVectorFromTMU(
-    Method& method, InstructionWalker it, const Value& dest, const Value& addr, const TMU& tmu, bool perLaneAddresses)
+    Method& method, InstructionWalker it, const Value& dest, const Value& addr, const TMU& tmu, bool perLaneAddresses,
+    bool laneUniformAddress)
 {
     using namespace intermediate;
     if(!dest.type.isSimpleType() && !dest.type.getPointerType())
@@ -300,7 +304,7 @@ InstructionWalker periphery::insertReadVectorFromTMU(
 
     if(dest.type.getScalarBitCount() == 64)
     {
-        if(perLaneAddresses)
+        if(perLaneAddresses || laneUniformAddress)
             // would require one 64-bit lookup per SIMD lane, which the TMU cannot perform
             throw CompilationError(CompilationStep::GENERAL, "Cannot gather 64-bit values via TMU", addr.to_string());
         return insertReadLongVectorFromTMU(method, it, dest, addr, tmu);
@@ -320,6 +324,21 @@ InstructionWalker periphery::insertReadVectorFromTMU(
         entry->perLaneAddresses = true;
         entry->customAddressCalculation = true;
         assign(it, entry->addresses) = addr;
+    }
+    else if(laneUniformAddress)
+    {
+        /*
+         * All merged work-items read the same address, so a single memory lookup suffices and its result is the value
+         * of every SIMD lane.
+         *
+         * The destination might still be a per-lane value (e.g. if it is also written by a read with a per-work-item
+         * address). Its number of elements must therefore not be used to calculate further addresses, which would read
+         * the successive elements instead of the single element all lanes require. Instead, only the single
+         * (lane-uniform) address is written and the value read for the first lane is replicated into all lanes (see
+         * #insertCalculateAddressOffsets()).
+         */
+        entry->laneUniformAddress = true;
+        entry->numVectorElements = Value(Literal(1u), TYPE_INT8);
     }
     it.emplace(std::make_unique<RAMAccessInstruction>(MemoryOperation::READ, addr, entry));
     it.nextInBlock();

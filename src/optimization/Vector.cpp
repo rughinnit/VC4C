@@ -154,6 +154,13 @@ static int calculateCostsVsBenefits(const ControlFlowLoop& loop, const Induction
                                     << it->to_string() << logging::endl);
                             return std::numeric_limits<int>::min();
                         }
+                        if(tmuCacheEntry->laneUniformAddress)
+                        {
+                            CPPLOG_LAZY(logging::Level::DEBUG,
+                                log << "Cannot vectorize loop containing a broadcast of a lane-uniform address: "
+                                    << it->to_string() << logging::endl);
+                            return std::numeric_limits<int>::min();
+                        }
                         if(isDynamicIterationCount && tmuCacheEntry->numVectorElements != 1_val)
                         {
                             CPPLOG_LAZY(logging::Level::DEBUG,

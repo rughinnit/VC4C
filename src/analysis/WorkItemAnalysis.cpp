@@ -1454,3 +1454,22 @@ FastMap<const BasicBlock*, ActiveWorkItems> analysis::determineActiveWorkItems(
 
     return results;
 }
+
+FastSet<const intermediate::MemoryInstruction*> analysis::findLaneUniformMemoryReads(const Method& method)
+{
+    LaneStepAnalysis laneSteps;
+    laneSteps.analyze(method);
+
+    FastSet<const intermediate::MemoryInstruction*> result;
+    method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+        const auto* mem = dynamic_cast<const intermediate::MemoryInstruction*>(&inst);
+        if(mem == nullptr || mem->op != intermediate::MemoryOperation::READ)
+            return;
+        // only an address with a proven step of 0 (i.e. the same address for every merged work-item) loads the same
+        // value for all SIMD lanes. For all other reads (e.g. an address loaded from a phi node or with a
+        // non-unit stride) the gather (or the contiguous multi-element load) must be kept.
+        if(laneSteps.getStep(mem->getSource()).isUniform())
+            result.emplace(mem);
+    });
+    return result;
+}
