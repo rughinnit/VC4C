@@ -530,7 +530,7 @@ bool intrinsics::intrinsifyWorkItemFunction(Method& method, TypedInstructionWalk
 }
 
 static void insertSingleSecondaryBlockCode(Method& method, BasicBlock& block, uint32_t index,
-    const Value& localSizeScalar, uint32_t maxGroupSize, const Local* afterLabel)
+    const Value& numParticipants, uint32_t maxGroupSize, const Local* afterLabel)
 {
     // decrement "own" semaphore to block until previous work-item released it
     auto it = block.walkEnd();
@@ -541,7 +541,7 @@ static void insertSingleSecondaryBlockCode(Method& method, BasicBlock& block, ui
     if(index + 1 < maxGroupSize)
     {
         // just copy to ease register association
-        auto tmp = assign(it, localSizeScalar.type, "%local_size_scalar") = localSizeScalar;
+        auto tmp = assign(it, numParticipants.type, "%barrier_num_participants") = numParticipants;
         auto cond = assignNop(it) = as_signed{tmp} > as_signed{Value(Literal(index + 1), TYPE_INT8)};
         tmp = assign(it, TYPE_BOOL) = (BOOL_TRUE, cond);
         assign(it, tmp) = (BOOL_FALSE, cond.invert());
@@ -568,8 +568,8 @@ static void insertSingleSecondaryBlockCode(Method& method, BasicBlock& block, ui
         it.emplace(std::make_unique<Branch>(afterLabel));
 }
 
-static void insertNonPrimaryBarrierCode(Method& method, BasicBlock& block, const Value& localIdScalar,
-    const Value& localSizeScalar, uint32_t maxGroupSize, const Local* afterLabel)
+static void insertNonPrimaryBarrierCode(Method& method, BasicBlock& block, const Value& syncIdScalar,
+    const Value& numParticipants, uint32_t maxGroupSize, const Local* afterLabel)
 {
     // all but the first work-item increment semaphore 0, so the first work-item can continue, wait on their own
     // semaphore and then increment the next one (if any)
@@ -577,9 +577,9 @@ static void insertNonPrimaryBarrierCode(Method& method, BasicBlock& block, const
     it.emplace(std::make_unique<SemaphoreAdjustment>(static_cast<Semaphore>(0), true));
     it.nextInBlock();
     // replicate to make sure the SIMD element 15 which is actually used by the branch is set correctly
-    auto localId = method.addNewLocal(localIdScalar.type, "%local_id_scalar");
-    auto switchIt = intermediate::insertReplication(it, localIdScalar, localId);
-    if(auto writer = localIdScalar.getSingleWriter())
+    auto localId = method.addNewLocal(syncIdScalar.type, "%barrier_sync_id");
+    auto switchIt = intermediate::insertReplication(it, syncIdScalar, localId);
+    if(auto writer = syncIdScalar.getSingleWriter())
         switchIt.copy().previousInBlock()->addDecorations(writer->decoration);
 
     // we need to create the other blocks first to be able to correctly update the CFG
@@ -589,7 +589,7 @@ static void insertNonPrimaryBarrierCode(Method& method, BasicBlock& block, const
         auto label = method.addNewLocal(TYPE_LABEL, "%barrier_single_block").local();
         it = method.emplaceLabel(it, std::make_unique<BranchLabel>(*label));
         singleBlocks.emplace(i, label);
-        insertSingleSecondaryBlockCode(method, *it.getBasicBlock(), i, localSizeScalar, maxGroupSize, afterLabel);
+        insertSingleSecondaryBlockCode(method, *it.getBasicBlock(), i, numParticipants, maxGroupSize, afterLabel);
     }
 
     // insert switch-case for all possible local IDs
@@ -605,16 +605,16 @@ static void insertNonPrimaryBarrierCode(Method& method, BasicBlock& block, const
     switchIt.emplace(std::make_unique<Branch>(branchTarget.local()));
 }
 
-static void insertPrimaryBarrierCode(Method& method, BasicBlock& block, const Value& localIdScalar,
-    const Value& localSizeScalar, uint32_t maxGroupSize, const Local* afterLabel,
+static void insertPrimaryBarrierCode(Method& method, BasicBlock& block, const Value& numParticipants,
+    uint32_t maxGroupSize, const Local* afterLabel,
     const std::function<InstructionWalker(InstructionWalker)>& insertFirstWorkItemOnlyCode)
 {
-    // the first work-item waits on its semaphore for all other to have increased it (size -1 times) and then wakes up
-    // the second work-item
+    // the first work-item (or QPU) waits on its semaphore for all other participants to have increased it and then
+    // wakes up the second participant
     auto it = block.walkEnd();
     // just copy to ease register association
-    auto localSize = assign(it, localSizeScalar.type, "%local_size_scalar") = localSizeScalar;
-    auto numRepetitions = assign(it, TYPE_INT8) = (localSize - 1_val, InstructionDecorations::PHI_NODE);
+    auto numRepetitions = assign(it, TYPE_INT8, "%barrier_num_repetitions") =
+        (numParticipants - 1_val, InstructionDecorations::PHI_NODE);
     auto& loopBlock = insertLoop(method, it, numRepetitions, "%barrier_primary_loop");
     {
         // inside loop
@@ -662,14 +662,32 @@ static void lowerBarrier(Method& method, InstructionWalker it,
      *
      * Since the semaphores have 4-bit (16 values) and there is a maximum of 12 work-items, they can't stall because of
      * overflow beyond 15
+     *
+     * With merged work-items, all work-items of one QPU execute in lockstep on the SIMD lanes, so the whole QPU arrives
+     * at the barrier at once. The semaphore instructions are executed once per QPU (not once per SIMD lane), so the
+     * barrier is indexed by the QPU slot within the work-group and the number of participants is the number of QPUs
+     * executing the work-group, i.e. ceil(local size / merge factor).
+     *
+     * The index cannot be the hardware QPU number (REG_QPU_NUMBER), since the protocol above requires the indices of
+     * the participating QPUs to be exactly 0..numParticipants-1 (the participant with index 0 is the primary), while
+     * the QPUs of a work-group are not numbered like that, e.g. a work-group spread over 4 QPUs runs on the QPUs
+     * numbered 8..11. Instead, the index is derived from the linear local ID, which is mergeFactor * slot + lane for
+     * merged work-items: shifting it down by log2(mergeFactor) gives the slot of the QPU within the work-group, which
+     * is 0..numParticipants-1 and identical for all SIMD lanes of the QPU.
      */
 
+    const auto fixedSize = method.metaData.getFixedWorkGroupSize();
     Optional<Value> localSizeScalar = NO_VALUE;
     auto maximumWorkGroupSize = NUM_QPUS;
 
-    if(auto fixedSize = method.metaData.getFixedWorkGroupSize())
+    const auto mergeFactor = std::max(static_cast<uint32_t>(method.metaData.mergedWorkItemsFactor), 1u);
+    const bool merged = mergeFactor > 1;
+    // the merge factor is a power of two (16), so the division by it can be done with a shift
+    const auto mergeFactorShift = Value(Literal(static_cast<uint32_t>(vc4c::log2(mergeFactor))), TYPE_INT8);
+
+    if(fixedSize)
     {
-        if(fixedSize == 1u)
+        if(*fixedSize == 1u)
         {
             // for a single work-item there is no need to synchronize
             CPPLOG_LAZY(logging::Level::DEBUG,
@@ -684,7 +702,11 @@ static void lowerBarrier(Method& method, InstructionWalker it,
         localSizeScalar = Value(Literal(*fixedSize), TYPE_INT8);
     }
 
-    // calculate the scalar local ID and size
+    // the value used to index the hardware semaphores: the linear local work-item ID or, for merged work-items, the
+    // QPU slot derived from it
+    Value syncIdScalar = UNDEFINED_VALUE;
+
+    // calculate the scalar linear local ID and the scalar local size
     Value localSizeX = UNDEFINED_VALUE;
     Value localSizeY = UNDEFINED_VALUE;
     Value localSizeZ = UNDEFINED_VALUE;
@@ -695,6 +717,12 @@ static void lowerBarrier(Method& method, InstructionWalker it,
     it = intrinsifyReadLocalLinearID(method, it, &localSizeX, &localSizeY, &localSizeZ);
     it.nextInBlock();
 
+    if(merged)
+        // the linear local ID is mergeFactor * slot + lane, so all SIMD lanes of one QPU yield the same slot
+        syncIdScalar = assign(it, TYPE_INT8, "%barrier_qpu_slot") = (as_unsigned{localIdScalar} >> mergeFactorShift);
+    else
+        syncIdScalar = localIdScalar;
+
     if(!localSizeScalar)
     {
         // local_size_scalar = local_size_z * local_size_y * local_size_x
@@ -704,6 +732,22 @@ static void lowerBarrier(Method& method, InstructionWalker it,
             InstructionDecorations::DIMENSION_SCALAR, InstructionDecorations::WORK_GROUP_UNIFORM_VALUE);
     }
 
+    // the number of barrier participants, i.e. the number of work-items (non-merged) or QPUs (merged) arriving at it
+    auto numParticipants = *localSizeScalar;
+    if(merged)
+    {
+        // one arrival per QPU: the number of participating QPUs is ceil(local size / merge factor), which is
+        // (local size - 1) / merge factor + 1 without requiring an integer division. The local size is at most
+        // NUM_QPUS * mergeFactor = 192, so the intermediate value still fits into the unsigned 8-bit type.
+        if(fixedSize)
+            numParticipants = Value(Literal((*fixedSize - 1u) / mergeFactor + 1u), TYPE_INT8);
+        else
+        {
+            auto tmp = assign(it, TYPE_INT8, "%barrier_num_participants") = (*localSizeScalar - 1_val);
+            tmp = assign(it, TYPE_INT8, "%barrier_num_participants") = (as_unsigned{tmp} >> mergeFactorShift);
+            numParticipants = assign(it, TYPE_INT8, "%barrier_num_participants") = (tmp + 1_val);
+        }
+    }
     auto branchIt = it.copy().previousInBlock();
 
     // we need to create the other blocks first to be able to correctly update the CFG
@@ -745,19 +789,19 @@ static void lowerBarrier(Method& method, InstructionWalker it,
     it.erase();
 
     // insert conditional jump for:
-    // - local ID != 0 -> secondary block
-    // - local ID == 0 && local size > 1 -> primary block
-    // - local ID == 0 && local size == 0 -> after block
+    // - local ID (or QPU slot) != 0 -> secondary block
+    // - local ID (or QPU slot) == 0 && participants > 1 -> primary block
+    // - local ID (or QPU slot) == 0 && participants == 1 -> after block
     branchIt.nextInBlock();
     BranchCond cond = BRANCH_ALWAYS;
-    std::tie(branchIt, cond) = insertBranchCondition(method, branchIt, localIdScalar /* local ID != 0 */);
+    std::tie(branchIt, cond) = insertBranchCondition(method, branchIt, syncIdScalar /* local ID/QPU slot != 0 */);
     branchIt.emplace(std::make_unique<Branch>(secondaryLabel, cond));
     branchIt.nextInBlock();
     branchIt.emplace(std::make_unique<Branch>(otherLabel, cond.invert()));
 
     branchIt = otherBlock->walkEnd();
-    auto tmp = assign(branchIt, TYPE_INT8) = (*localSizeScalar ^ 1_val);
-    std::tie(branchIt, cond) = insertBranchCondition(method, branchIt, tmp /* local size != 1 */);
+    auto tmp = assign(branchIt, TYPE_INT8) = (numParticipants ^ 1_val);
+    std::tie(branchIt, cond) = insertBranchCondition(method, branchIt, tmp /* number of participants != 1 */);
     branchIt.emplace(std::make_unique<Branch>(primaryLabel, cond));
     branchIt.nextInBlock();
     branchIt.emplace(std::make_unique<Branch>(skipBarrierLabel, cond.invert()));
@@ -765,8 +809,8 @@ static void lowerBarrier(Method& method, InstructionWalker it,
 
     // insert the actual content
     insertNonPrimaryBarrierCode(
-        method, *secondaryBlock, localIdScalar, *localSizeScalar, maximumWorkGroupSize, afterLabel);
-    insertPrimaryBarrierCode(method, *primaryBlock, localIdScalar, *localSizeScalar, maximumWorkGroupSize, afterLabel,
+        method, *secondaryBlock, syncIdScalar, numParticipants, maximumWorkGroupSize, afterLabel);
+    insertPrimaryBarrierCode(method, *primaryBlock, numParticipants, maximumWorkGroupSize, afterLabel,
         insertFirstWorkItemOnlyCode);
 }
 
