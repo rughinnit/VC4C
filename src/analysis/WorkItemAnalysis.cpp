@@ -16,6 +16,7 @@
 #include "FlagsAnalysis.h"
 
 #include <algorithm>
+#include <bitset>
 #include <queue>
 
 using namespace vc4c;
@@ -491,15 +492,8 @@ static void scanWorkItemUsage(const Module& module, const Method& method, FastSe
             return;
         }
 
-        // Work-item-divergent control flow cannot be expressed as a masked store, since the VPM always writes a full
-        // row and the DMA copies a fixed depth. Be conservative and reject any conditional branch: even though a
-        // branch on a lane-uniform condition could in principle be executed by all merged work-items, the values
-        // flowing through such a branch cannot be verified to stay per-lane (see #checkLaneDependentMemoryAccesses).
-        if(const auto* branch = dynamic_cast<const intermediate::Branch*>(&inst))
-        {
-            if(!branch->isUnconditional())
-                reason = "contains conditional branches (divergent control flow is not supported)";
-        }
+        // NOTE: conditional branches are not rejected here, since whether they are allowed depends on their condition
+        // being provably lane-uniform, which is checked after inlining by #checkUniformBranchConditions().
     });
 }
 
@@ -549,6 +543,60 @@ namespace
     class LaneStepAnalysis
     {
     public:
+        /*
+         * Pre-calculates the lane step of all values of the given method.
+         *
+         * This iterates the evaluation to a fixed point, since the values of a loop may depend on themselves (e.g. the
+         * loop induction variable is initialized before the loop and incremented within it). Starting from the
+         * optimistic assumption that all values are lane-invariant, a value only becomes lane-dependent if one of its
+         * definitions (e.g. the initial value or the increment in the loop body) can make it lane-dependent. This
+         * keeps e.g. a loop counter uniform instead of assuming the worst for the circular dependency.
+         */
+        void analyze(const Method& method)
+        {
+            FastSet<const Local*> locals;
+            method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+                if(auto out = inst.getOutput())
+                    if(auto local = out->checkLocal())
+                        locals.emplace(local);
+                for(const auto& arg : inst.getArguments())
+                    if(auto local = arg.checkLocal())
+                        locals.emplace(local);
+            });
+
+            for(auto* local : locals)
+                results.emplace(local, LaneStep::uniform());
+
+            // each iteration can only change a value from a known step to an unknown one, so this converges quickly
+            for(std::size_t iteration = 0; iteration < locals.size() * 2u + 2u; ++iteration)
+            {
+                bool changed = false;
+                for(auto* local : locals)
+                {
+                    if(local->is<Parameter>() || local->type == TYPE_LABEL)
+                        continue;
+                    const auto newStep = determineStep(*local);
+                    auto oldStepIt = results.find(local);
+                    if(oldStepIt == results.end())
+                    {
+                        results.emplace(local, newStep);
+                        changed = true;
+                        continue;
+                    }
+                    auto& oldStep = oldStepIt->second;
+                    if(newStep.known != oldStep.known || newStep.step != oldStep.step)
+                    {
+                        oldStep = newStep;
+                        changed = true;
+                    }
+                }
+                if(!changed)
+                    return;
+            }
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Lane step analysis did not converge, using the last result" << logging::endl);
+        }
+
         LaneStep getStep(const Value& value)
         {
             if(value.getConstantValue(true))
@@ -572,6 +620,15 @@ namespace
             pending.erase(local);
             results.emplace(local, result);
             return result;
+        }
+
+        /*
+         * Returns the change of the value calculated by the given instruction (ignoring any other writer of the
+         * instruction's output local), i.e. the result of exactly this definition.
+         */
+        LaneStep getResultStep(const intermediate::IntermediateInstruction& inst)
+        {
+            return determineInstructionStep(inst);
         }
 
     private:
@@ -943,6 +1000,239 @@ namespace
         });
         return reason;
     }
+
+    /*
+     * Returns the (part of the) instruction which sets the flags the given branch condition depends on.
+     *
+     * The flags of the QPU are a single (per-quad) register, so a branch does not have an explicit condition operand,
+     * but uses the flags set by the (last) preceding flag-setting instruction. For a combined instruction, only the
+     * part setting the flags is relevant, since the arguments of the other part do not influence the flags.
+     */
+    static const intermediate::IntermediateInstruction* getFlagSetter(const intermediate::IntermediateInstruction* inst)
+    {
+        if(inst == nullptr)
+            return nullptr;
+        if(const auto* combined = dynamic_cast<const intermediate::CombinedOperation*>(inst))
+        {
+            if(combined->getFirstOp() && combined->getFirstOp()->doesSetFlag())
+                return combined->getFirstOp();
+            if(combined->getSecondOp() && combined->getSecondOp()->doesSetFlag())
+                return combined->getSecondOp();
+            return nullptr;
+        }
+        return inst->doesSetFlag() ? inst : nullptr;
+    }
+
+    /*
+     * Checks whether the given value, or the flags its definition depends on, is derived from a work-item ID.
+     *
+     * This walks the value back through its definitions. Besides the data operands, the flags of conditionally
+     * executed instructions are followed as well: a boolean value materialized from a comparison (e.g. the condition
+     * of a branch) is written by conditional moves of the constants 0 and 1, whose data operands are lane-invariant
+     * even when the comparison itself compares lane-dependent values. The actual comparison operands are only visible
+     * through the flags the conditional moves depend on.
+     *
+     * Any instruction whose flags cannot be resolved is treated as lane-dependent, so the caller rejects the merge
+     * instead of guessing.
+     */
+    static bool isLaneDependentCondition(const Value& value, LaneStepAnalysis& laneSteps,
+        const FastMap<const intermediate::IntermediateInstruction*, ConstInstructionWalker>& positions,
+        FastSet<const Local*>& open, FastMap<const Local*, bool>& memo)
+    {
+        if(!laneSteps.getStep(value).isUniform())
+            // the value itself is calculated per work-item
+            return true;
+
+        auto local = value.checkLocal();
+        if(local == nullptr)
+            // the element number register is the SIMD lane index, all other registers available at this stage are
+            // uniform for the whole work-group
+            return value.hasRegister(REG_ELEMENT_NUMBER);
+
+        auto memoIt = memo.find(local);
+        if(memoIt != memo.end())
+            return memoIt->second;
+        if(!open.emplace(local).second)
+            // circular dependency, the other definitions determine the value
+            return false;
+
+        bool laneDependent = false;
+        local->forUsers(LocalUse::Type::WRITER, [&](const LocalUser* writer) {
+            if(laneDependent)
+                return;
+            // the data operands (for the conditional moves of a boolean value, these are only constants)
+            for(const auto& arg : writer->getArguments())
+            {
+                if(isLaneDependentCondition(arg, laneSteps, positions, open, memo))
+                {
+                    laneDependent = true;
+                    return;
+                }
+            }
+            if(!writer->hasConditionalExecution())
+                return;
+
+            // the writer only executes depending on flags, follow the values setting those flags
+            auto positionIt = positions.find(writer);
+            if(positionIt == positions.end())
+            {
+                // e.g. part of a combined instruction, cannot determine the flags
+                laneDependent = true;
+                return;
+            }
+            auto flagsIt = positionIt->second.getBasicBlock()->findLastSettingOfFlags(positionIt->second);
+            if(!flagsIt)
+            {
+                laneDependent = true;
+                return;
+            }
+            const auto* flagSetter = getFlagSetter(flagsIt->get());
+            if(flagSetter == nullptr || flagSetter->hasConditionalExecution())
+            {
+                laneDependent = true;
+                return;
+            }
+            for(const auto& arg : flagSetter->getArguments())
+            {
+                if(isLaneDependentCondition(arg, laneSteps, positions, open, memo))
+                {
+                    laneDependent = true;
+                    return;
+                }
+            }
+        });
+        open.erase(local);
+        memo.emplace(local, laneDependent);
+        return laneDependent;
+    }
+
+    /*
+     * Checks whether the condition of the given conditional branch is provably independent of the work-item ID, i.e.
+     * uniform across all SIMD lanes of a merged group.
+     *
+     * A conditional branch inside a merged kernel is executed once for the whole QPU, so if the condition differed
+     * between the merged work-items, the branch would be taken for all of them at once. Since there is no per-lane
+     * control flow, such a branch would calculate wrong values. The condition is a set of flags set by a previous
+     * instruction, so this walks the operands of that flag-setting instruction back through their definitions and only
+     * accepts the branch if none of them is derived from a work-item ID. Since the flags are shared by all SIMD lanes,
+     * a condition which depends on a per-lane load or comparison is rejected.
+     */
+    static std::string checkUniformBranchConditions(const Method& method, LaneStepAnalysis& laneSteps)
+    {
+        FastMap<const intermediate::IntermediateInstruction*, ConstInstructionWalker> positions;
+        for(const auto& block : method)
+        {
+            for(auto it = block.walk(); !it.isEndOfBlock(); it.nextInBlock())
+                positions.emplace(it.get(), it);
+        }
+
+        std::string reason;
+        for(const auto& block : method)
+        {
+            for(auto it = block.walk(); !it.isEndOfBlock() && reason.empty(); it.nextInBlock())
+            {
+                const auto* branch = it.get<intermediate::Branch>();
+                if(branch == nullptr)
+                    continue;
+
+                if(branch->isDynamicBranch() && !laneSteps.getStep(branch->getTarget()).isUniform())
+                {
+                    // the branch executes once for all merged work-items, so its target must be the same for all of
+                    // them as well
+                    reason = "contains a branch to a lane-dependent target: " + branch->to_string();
+                    break;
+                }
+                if(branch->isUnconditional())
+                    continue;
+
+                auto flagsIt = block.findLastSettingOfFlags(it);
+                if(!flagsIt)
+                {
+                    reason = "contains a conditional branch whose flags are not set in the same basic block: " +
+                        branch->to_string();
+                    break;
+                }
+                const auto* flagSetter = getFlagSetter(flagsIt->get());
+                if(flagSetter == nullptr || flagSetter->hasConditionalExecution())
+                {
+                    reason =
+                        "contains a conditional branch whose flags are set conditionally or cannot be determined: " +
+                        branch->to_string();
+                    break;
+                }
+                // resolve the value the flags are calculated from (the "or element-number" idiom used to set branch
+                // flags only makes the first SIMD element meaningful, all other elements are forced to non-zero)
+                auto condition = intermediate::getBranchCondition(
+                    dynamic_cast<const intermediate::ExtendedInstruction*>(flagSetter));
+                if(!condition.first)
+                {
+                    reason =
+                        "contains a conditional branch whose condition cannot be determined: " + branch->to_string();
+                    break;
+                }
+                if(condition.second != std::bitset<NATIVE_VECTOR_SIZE>{0x1})
+                {
+                    // the branch depends on the flags of specific SIMD elements, i.e. the work-items diverge
+                    reason = "contains a conditional branch on the comparison result of specific SIMD elements: " +
+                        branch->to_string();
+                    break;
+                }
+
+                FastSet<const Local*> open;
+                FastMap<const Local*, bool> memo;
+                if(isLaneDependentCondition(*condition.first, laneSteps, positions, open, memo))
+                {
+                    reason = "contains a conditional branch on a lane-dependent condition (" +
+                        condition.first->to_string() + "): " + branch->to_string();
+                    break;
+                }
+            }
+            if(!reason.empty())
+                break;
+        }
+        return reason;
+    }
+
+    /*
+     * Checks whether all definitions of a value that is lane-dependent on at least one path can be made per-lane.
+     *
+     * The vector width propagation turns every lane-dependent local into a 16-element vector (one element per SIMD
+     * lane) for all its uses. A lane-invariant definition of such a local (e.g. its initial value before a loop or a
+     * conditional assignment) must therefore be replicated to all 16 lanes. The normalizer can only do this for
+     * instructions calculating their result element-wise from their operands (simple assignments and ALU operations);
+     * for anything else, only the first lane would be written. In that case, merging must be rejected instead of
+     * emitting a partially written, but vector-typed value.
+     */
+    static std::string checkLaneDependentValueDefinitions(const Method& method, LaneStepAnalysis& laneSteps)
+    {
+        std::string reason;
+        method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+            if(!reason.empty())
+                return;
+            auto out = inst.getOutput();
+            auto local = out ? out->checkLocal() : nullptr;
+            if(local == nullptr || !local->type.isSimpleType() || local->type.getVectorWidth() > 1)
+                return;
+            if(local->is<Parameter>() || local->is<Global>() || local->is<StackAllocation>() ||
+                local->is<BuiltinLocal>())
+                // these locals keep their scalar type, see #propagateMergedWorkItemTypes()
+                return;
+            if(laneSteps.getStep(*out).isUniform())
+                // the local stays lane-invariant for all definitions, so its vector width is irrelevant
+                return;
+            if(!laneSteps.getResultStep(inst).isUniform())
+                // this definition calculates a lane-dependent value, so it writes all SIMD lanes
+                return;
+            if(dynamic_cast<const intermediate::MoveOperation*>(&inst) != nullptr ||
+                dynamic_cast<const intermediate::Operation*>(&inst) != nullptr)
+                // element-wise instruction, its lane-invariant operands can be replicated to all SIMD lanes
+                return;
+            reason = "writes a lane-invariant value which cannot be replicated to all work-items into a "
+                     "lane-dependent value: " +
+                inst.to_string();
+        });
+        return reason;
+    }
 } // namespace
 
 Optional<std::string> analysis::checkWorkItemMerging(const Module& module, const Method& kernel, uint8_t factor)
@@ -971,12 +1261,19 @@ Optional<std::string> analysis::checkWorkItemMerging(const Module& module, const
         return std::string{"does not read any work-item IDs"};
 
     LaneStepAnalysis laneSteps;
+    laneSteps.analyze(kernel);
+    auto branchReason = checkUniformBranchConditions(kernel, laneSteps);
+    if(!branchReason.empty())
+        return branchReason;
     auto memoryReason = checkLaneDependentMemoryAccesses(kernel, laneSteps);
     if(!memoryReason.empty())
         return memoryReason;
     auto useReason = checkLaneDependentValueUses(kernel, laneSteps);
     if(!useReason.empty())
         return useReason;
+    auto definitionReason = checkLaneDependentValueDefinitions(kernel, laneSteps);
+    if(!definitionReason.empty())
+        return definitionReason;
     auto typeReason = checkLaneDependentValueTypes(kernel, laneSteps);
     if(!typeReason.empty())
         return typeReason;
