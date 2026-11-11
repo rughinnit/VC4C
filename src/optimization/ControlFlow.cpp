@@ -901,9 +901,7 @@ static bool usesWorkItemSpecificBuiltins(const Method& kernel)
  * any of them can start executing the next work-group iteration. The expected behavior is very similar to the
  * barrier(...) OpenCL C function.
  *
- * Returns the reason why the synchronization can be skipped, or no value if a synchronization block is required. This
- * is also used to decide whether the work-group loop can be used for kernels with merged work-items, for which the
- * semaphore-based barrier of the synchronization block cannot be used (see addWorkGroupLoop()).
+ * Returns the reason why the synchronization can be skipped, or no value if a synchronization block is required.
  */
 static Optional<const char*> getWorkItemSynchronizationSkipReason(const Method& method)
 {
@@ -981,23 +979,12 @@ std::size_t optimizations::addWorkGroupLoop(const Module& module, Method& method
     if(method.walkAllInstructions().isEndOfMethod())
         return 0u;
 
-    // The synchronization block between two work-group loop iterations uses a control flow barrier, which is
-    // implemented via semaphores indexed by the work-item. These cannot be expressed for 16 merged work-items running
-    // in parallel on the SIMD lanes of one QPU. If no synchronization is required (e.g. because there are no
-    // cross-work-item memory dependencies), the loop itself is unaffected by the merging: it only iterates the
-    // work-group ID, which is uniform across all work-items of the work-group and therefore also across all SIMD lanes
-    // of a merged execution.
+    // The synchronization block between two work-group loop iterations uses a control flow barrier. For merged
+    // work-items, that barrier is indexed by the QPU slot derived from the linear work-item ID (the SIMD lanes of one
+    // QPU always arrive together) and the work-group loop only iterates the work-group ID, which is uniform across all
+    // work-items and all QPUs of the merged execution. The loop can therefore be used for merged kernels just like for
+    // non-merged ones.
     const auto synchronizationSkipReason = getWorkItemSynchronizationSkipReason(method);
-    if(method.metaData.mergedWorkItemsFactor > 1 && !synchronizationSkipReason)
-    {
-        // Without the loop, every work-group is launched separately by the run-time (which still runs 16 work-items in
-        // parallel), so the cross-work-group ordering is guaranteed.
-        CPPLOG_LAZY(logging::Level::WARNING,
-            log << "Skipping work-group loop for kernel with merged work-items, which requires work-item "
-                   "synchronization: "
-                << method.name << logging::endl);
-        return 0u;
-    }
     CPPLOG_LAZY(
         logging::Level::DEBUG, log << "Wrapping kernel " << method.name << " in a work-group loop..." << logging::endl);
 

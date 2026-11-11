@@ -447,23 +447,38 @@ static const Method* findCalledMethod(const Module& module, const intermediate::
     return nullptr;
 }
 
+/*
+ * Information gathered while scanning the (inlined) kernel-function and all functions called from it.
+ */
+struct WorkItemUsage
+{
+    bool usesIds = false;
+    bool usesBarrier = false;
+    bool usesQpuNumber = false;
+    std::string reason;
+};
+
 static void scanWorkItemUsage(const Module& module, const Method& method, FastSet<const Method*>& visited,
-    bool& usesIds, std::string& reason)
+    WorkItemUsage& usage)
 {
     if(!visited.emplace(&method).second)
         return;
 
     method.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
-        if(!reason.empty())
+        if(!usage.reason.empty())
             return;
 
-        // barriers are implemented via semaphores, which are indexed by the work-item. They cannot be expressed for
-        // 16 work-items running in parallel on the SIMD lanes of one QPU.
+        // the QPU number is identical for all SIMD lanes of one QPU, but differs between the work-items executed by
+        // different QPUs. It is the only work-group-uniform value which can differ between the QPUs of a work-group,
+        // so a kernel reading it can diverge between the QPUs (see #checkBarrierLowering())
+        if(inst.readsRegister(REG_QPU_NUMBER))
+            usage.usesQpuNumber = true;
+
         const auto signal = inst.getSignal();
         if(signal == SIGNAL_SWITCH_THREAD || signal == SIGNAL_THREAD_SWITCH_LAST || signal == SIGNAL_END_PROGRAM ||
             signal == SIGNAL_SOFT_BREAK)
         {
-            reason = "contains a thread control signal";
+            usage.reason = "contains a thread control signal";
             return;
         }
 
@@ -471,24 +486,28 @@ static void scanWorkItemUsage(const Module& module, const Method& method, FastSe
         {
             if(call->methodName == "vc4cl_barrier")
             {
-                reason = "contains a work-group barrier";
+                // whether a barrier can be lowered for merged work-items is checked after inlining by
+                // #checkBarrierLowering()
+                usage.usesBarrier = true;
                 return;
             }
+            if(call->methodName == "vc4cl_qpu_number")
+                usage.usesQpuNumber = true;
             if(isWorkItemIdFunction(call->methodName))
             {
-                usesIds = true;
+                usage.usesIds = true;
                 // the dimension of the ID cannot be checked, if it is not a constant (the value is a constant even if
                 // it was propagated through the temporarily created parameter of an inlined function)
                 const auto dimension = call->getArgument(0);
                 if((call->methodName == "vc4cl_local_id" || call->methodName == "vc4cl_global_id") &&
                     !(dimension && dimension->getConstantValue(true) & &Value::getLiteralValue))
                 {
-                    reason = "reads a work-item ID with a non-constant dimension: " + call->to_string();
+                    usage.reason = "reads a work-item ID with a non-constant dimension: " + call->to_string();
                 }
                 return;
             }
             if(const auto* calledMethod = findCalledMethod(module, *call))
-                scanWorkItemUsage(module, *calledMethod, visited, usesIds, reason);
+                scanWorkItemUsage(module, *calledMethod, visited, usage);
             return;
         }
 
@@ -731,6 +750,12 @@ namespace
                     return binaryStep(inst, LaneOp::MUL);
                 if(intrinsic->opCode == "shl")
                     return binaryStep(inst, LaneOp::SHL);
+                // sign/zero extension and truncation are linear (the work-item IDs are small enough to not overflow),
+                // so they keep the step of their operand. This is e.g. used for the local ID, which is read as a byte
+                // (i8) and then widened to i32 for the address calculation.
+                if((intrinsic->opCode == "zext" || intrinsic->opCode == "sext" || intrinsic->opCode == "trunc") &&
+                    inst.getArguments().size() == 1u)
+                    return getStep(inst.assertArgument(0));
             }
 
             return argumentsStep(inst);
@@ -922,8 +947,9 @@ namespace
                     // the read address is lowered to a per-SIMD-lane TMU address vector, which performs a gather
                     return;
                 reason = "accesses memory at a lane-dependent address which does not advance by exactly one element "
-                         "per work-item: " +
-                    mem->to_string();
+                         "per work-item (step " +
+                    (addressStep.known ? std::to_string(addressStep.step) : std::string{"unknown"}) + " bytes, element " +
+                    std::to_string(elementBytes) + " bytes): " + mem->to_string();
             }
         });
         return reason;
@@ -1233,6 +1259,38 @@ namespace
         });
         return reason;
     }
+
+    /*
+     * Checks whether the work-group barriers of the given kernel can be lowered for merged work-items.
+     *
+     * With merged work-items, a barrier is implemented as a semaphore rendezvous between the QPUs executing the
+     * work-group: every QPU arrives once for all of its 16 SIMD lanes, since they execute in lockstep. This is only
+     * correct if every QPU arrives at the barrier the same number of times, i.e. if no barrier is inside control flow
+     * which diverges between the QPUs of the work-group.
+     *
+     * Conditional branches are already required to be lane-uniform (see #checkUniformBranchConditions()) and any value
+     * derived from the work-item ID or from a per-work-item memory address therefore is identical for all work-items
+     * of the work-group. The remaining lane-uniform values which differ between the QPUs are the QPU number itself and
+     * values derived from it. Kernels which read the QPU number can hence branch differently per QPU, so the barriers
+     * of those kernels cannot be lowered safely.
+     */
+    static std::string checkBarrierLowering(const Method& kernel, const WorkItemUsage& usage)
+    {
+        if(!usage.usesBarrier)
+            return {};
+        if(usage.usesQpuNumber)
+            return std::string{"reads the QPU number and contains a work-group barrier, so the barrier could be "
+                               "inside control flow which diverges between the QPUs executing the work-group"};
+        if(kernel.metaData.getFixedWorkGroupSize())
+            // For a compile-time known work-group size, the merged memory lowering stores the values of a merged group
+            // to the wrong place (the VPM staging area is allocated differently than for an unknown work-group size,
+            // so only the first SIMD lane ends up in memory). This is independent of the barrier and needs to be fixed
+            // in the VPM allocation before such kernels can be merged. Until then, keep them unmerged, which is
+            // exactly the behavior before work-item barriers were supported.
+            return std::string{"contains a work-group barrier and a compile-time work-group size, for which the "
+                               "merged memory lowering is not correct yet"};
+        return {};
+    }
 } // namespace
 
 Optional<std::string> analysis::checkWorkItemMerging(const Module& module, const Method& kernel, uint8_t factor)
@@ -1250,15 +1308,17 @@ Optional<std::string> analysis::checkWorkItemMerging(const Module& module, const
     }
 
     FastSet<const Method*> visited;
-    bool usesIds = false;
-    std::string reason;
-    scanWorkItemUsage(module, kernel, visited, usesIds, reason);
-    if(!reason.empty())
-        return reason;
-    if(!usesIds)
+    WorkItemUsage usage;
+    scanWorkItemUsage(module, kernel, visited, usage);
+    if(!usage.reason.empty())
+        return usage.reason;
+    if(!usage.usesIds)
         // without reading any work-item ID, all work-items execute the same code. Merging them would execute the
         // kernel only once per merged group and could change observable behavior (e.g. atomics, global counters).
         return std::string{"does not read any work-item IDs"};
+    auto barrierReason = checkBarrierLowering(kernel, usage);
+    if(!barrierReason.empty())
+        return barrierReason;
 
     LaneStepAnalysis laneSteps;
     laneSteps.analyze(kernel);
