@@ -81,7 +81,9 @@ namespace vc4c
             MANDATORY_DELAY = 1u << 15u,
             // The instructions inserts a single element into a vector
             ELEMENT_INSERTION = 1u << 16u,
-            // 1 << 17 IS UNUSED
+            // The instruction operates on a value which is calculated per SIMD lane of the merged work-items, e.g. a
+            // memory address which is different for every work-item (a gather/scatter)
+            PER_LANE_ADDRESS = 1u << 17u,
             // The result of the instruction is the same for all work-items within a single work-group
             WORK_GROUP_UNIFORM_VALUE = 1u << 18u,
             // The instruction calculates VPM read configuration
