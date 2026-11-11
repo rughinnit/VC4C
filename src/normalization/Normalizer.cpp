@@ -12,6 +12,7 @@
 #include "../Module.h"
 #include "../Profiler.h"
 #include "../ThreadPool.h"
+#include "../analysis/WorkItemAnalysis.h"
 #include "../intermediate/VectorHelper.h"
 #include "../intrinsics/Intrinsics.h"
 #include "../optimization/ControlFlow.h"
@@ -445,14 +446,32 @@ static void propagateMergedWorkItemTypes(Method& method)
      * so the per-lane-ness of the address would be lost otherwise. E.g. a per-lane read address allows performing a
      * gather via TMU, one memory lookup per SIMD lane, instead of reading a single contiguous block.
      */
+    const auto laneUniformReads = analysis::findLaneUniformMemoryReads(method);
     method.forAllInstructions([&](const IntermediateInstruction& inst) {
         auto mem = dynamic_cast<const MemoryInstruction*>(&inst);
         if(mem == nullptr)
             return;
+        if(mem->op == MemoryOperation::READ)
+        {
+            if(laneUniformReads.find(mem) != laneUniformReads.end())
+            {
+                /*
+                 * The read address is identical for all merged work-items, so the same element is loaded for every
+                 * SIMD lane. If the loaded value is used per work-item (its destination is a per-lane value), the
+                 * default lowering would be wrong, since it derives the addresses of the other lanes from the
+                 * address of the first lane plus element offsets and thus loads the following elements. Instead, mark
+                 * the read to be lowered as a single lookup whose result is broadcast into all SIMD lanes.
+                 */
+                if(isDivergent(mem->getDestination()) && mem->getDestination().type.getVectorWidth() > 1)
+                    const_cast<MemoryInstruction*>(mem)->addDecorations(InstructionDecorations::BROADCAST_READ);
+                return;
+            }
+            if(isDivergent(mem->getSource()))
+                const_cast<MemoryInstruction*>(mem)->addDecorations(InstructionDecorations::PER_LANE_ADDRESS);
+            return;
+        }
         // for a write, the destination is the address. For a copy, both sides are addresses
-        const bool perLaneAddress = mem->op == MemoryOperation::READ ?
-            isDivergent(mem->getSource()) :
-            (isDivergent(mem->getDestination()) || isDivergent(mem->getSource()));
+        const bool perLaneAddress = isDivergent(mem->getDestination()) || isDivergent(mem->getSource());
         if(perLaneAddress)
             const_cast<MemoryInstruction*>(mem)->addDecorations(InstructionDecorations::PER_LANE_ADDRESS);
     });

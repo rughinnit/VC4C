@@ -93,6 +93,15 @@ namespace vc4c
              * per lane, a gather) instead of a single base address the per-lane addresses are derived from.
              */
             bool perLaneAddresses;
+            /**
+             * If this flag is set, the address is identical for all merged work-items and the value read is broadcast
+             * into all SIMD lanes of the destination. Since only a single element is loaded, the number of vector
+             * elements is 1.
+             *
+             * This is needed for reads whose destination is a per-lane value: the number of elements of the
+             * destination must not be used to calculate the addresses of the other lanes.
+             */
+            bool laneUniformAddress;
         };
 
         /**
@@ -137,9 +146,14 @@ namespace vc4c
 
         /*
          * Generates the intermediate TMU memory/cache access instructions representing the given TMU data lookup.
+         *
+         * If the address of the lookup is identical for all merged work-items, laneUniformAddress must be set. The
+         * lookup then loads a single element which is broadcast into all SIMD lanes of the destination, instead of
+         * deriving the addresses of the other lanes from the address of the first lane.
          */
         NODISCARD InstructionWalker insertReadVectorFromTMU(Method& method, InstructionWalker it, const Value& dest,
-            const Value& addr, const TMU& tmu = TMU0, bool perLaneAddresses = false);
+            const Value& addr, const TMU& tmu = TMU0, bool perLaneAddresses = false,
+            bool laneUniformAddress = false);
 
         /**
          * Lowers the intermediate TMU (cache) access instructions to the hardware instructions actually performed to

@@ -18,6 +18,11 @@ namespace vc4c
     class Method;
     class Module;
 
+    namespace intermediate
+    {
+        class MemoryInstruction;
+    } /* namespace intermediate */
+
     namespace analysis
     {
         /**
@@ -31,6 +36,22 @@ namespace vc4c
          * intrinsified by the normalization) with their actual (constant or dynamic) dimension arguments.
          */
         Optional<std::string> checkWorkItemMerging(const Module& module, const Method& kernel, uint8_t factor);
+
+        /**
+         * Finds all memory reads of the given method which access an address that is identical for all merged
+         * work-items.
+         *
+         * Such a read loads exactly one element which is the value of every SIMD lane, so the memory lowering can
+         * perform a single lookup and broadcast the loaded value into all lanes, instead of a gather (for a per-lane
+         * address) or a contiguous multi-element load (which would read the following elements).
+         *
+         * Only the read addresses which are provably lane-uniform are returned, i.e. reads whose address is
+         * lane-dependent in an unknown way (e.g. a phi node without a uniform step) are not contained.
+         *
+         * NOTE: Like #checkWorkItemMerging(), this must be run on the intermediate code after inlining, since it
+         * follows the address calculation which is (partially) contained in the inlined functions.
+         */
+        FastSet<const intermediate::MemoryInstruction*> findLaneUniformMemoryReads(const Method& method);
 
         class ControlFlowGraph;
 
