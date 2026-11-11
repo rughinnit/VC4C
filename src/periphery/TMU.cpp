@@ -25,7 +25,8 @@ static std::atomic_uint tmuCacheEntryCounter{0};
 TMUCacheEntry::TMUCacheEntry(const TMU& tmu, const Value& addr, DataType originalType) :
     index(tmuCacheEntryCounter++), tmu(tmu), addresses(addr),
     numVectorElements(Value(Literal(originalType.getPointerType() ? 1 : originalType.getVectorWidth()), TYPE_INT8)),
-    elementStrideInBytes(originalType.getScalarBitCount() / 8), customAddressCalculation(false)
+    elementStrideInBytes(originalType.getScalarBitCount() / 8), customAddressCalculation(false),
+    perLaneAddresses(false)
 {
     if(!originalType.isSimpleType() && !originalType.getPointerType())
         throw CompilationError(
@@ -290,7 +291,7 @@ static NODISCARD InstructionWalker insertReadLongVectorFromTMU(
 }
 
 InstructionWalker periphery::insertReadVectorFromTMU(
-    Method& method, InstructionWalker it, const Value& dest, const Value& addr, const TMU& tmu)
+    Method& method, InstructionWalker it, const Value& dest, const Value& addr, const TMU& tmu, bool perLaneAddresses)
 {
     using namespace intermediate;
     if(!dest.type.isSimpleType() && !dest.type.getPointerType())
@@ -298,11 +299,28 @@ InstructionWalker periphery::insertReadVectorFromTMU(
             CompilationStep::GENERAL, "Reading of this type via TMU is not (yet) implemented", dest.type.to_string());
 
     if(dest.type.getScalarBitCount() == 64)
+    {
+        if(perLaneAddresses)
+            // would require one 64-bit lookup per SIMD lane, which the TMU cannot perform
+            throw CompilationError(CompilationStep::GENERAL, "Cannot gather 64-bit values via TMU", addr.to_string());
         return insertReadLongVectorFromTMU(method, it, dest, addr, tmu);
+    }
 
     // NOTE: actually this is baseAddr.type * type.num, but we can't have vectors of pointers
     auto entry =
         tmu.createEntry(method.addNewLocal(TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE), "%tmu_address"), dest.type);
+    if(perLaneAddresses)
+    {
+        /*
+         * A read of merged work-items with a per-work-item address has one (possibly different) address per SIMD lane.
+         * Writing this address vector to the TMU s-coordinate performs a gather, i.e. one memory lookup per SIMD lane.
+         * Deriving the addresses from the address of the first lane instead (as done for single work-items) would
+         * read consecutive words, which is only correct if the addresses advance by exactly one element.
+         */
+        entry->perLaneAddresses = true;
+        entry->customAddressCalculation = true;
+        assign(it, entry->addresses) = addr;
+    }
     it.emplace(std::make_unique<RAMAccessInstruction>(MemoryOperation::READ, addr, entry));
     it.nextInBlock();
     it.emplace(std::make_unique<CacheAccessInstruction>(MemoryOperation::READ, dest, entry));

@@ -816,6 +816,8 @@ MemoryAccessInfo normalization::determineMemoryAccess(Method& method)
                 }
             }
             else if(memInstr->op == MemoryOperation::READ && !memInstr->hasConditionalExecution() &&
+                // a read with a per-lane address is a gather, it cannot be expressed as a contiguous memory copy
+                !memInstr->hasDecoration(intermediate::InstructionDecorations::PER_LANE_ADDRESS) &&
                 hasSingleReader(memInstr->getDestination().local()))
             {
                 // convert read-then-write to copy

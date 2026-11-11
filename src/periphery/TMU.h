@@ -88,6 +88,11 @@ namespace vc4c
              * special case handling) and will not be overwritten on lowering the RAM access for this TMU cache entry.
              */
             bool customAddressCalculation;
+            /**
+             * If this flag is set, the addresses are the per-SIMD-lane addresses of the merged work-items (one address
+             * per lane, a gather) instead of a single base address the per-lane addresses are derived from.
+             */
+            bool perLaneAddresses;
         };
 
         /**
@@ -133,8 +138,8 @@ namespace vc4c
         /*
          * Generates the intermediate TMU memory/cache access instructions representing the given TMU data lookup.
          */
-        NODISCARD InstructionWalker insertReadVectorFromTMU(
-            Method& method, InstructionWalker it, const Value& dest, const Value& addr, const TMU& tmu = TMU0);
+        NODISCARD InstructionWalker insertReadVectorFromTMU(Method& method, InstructionWalker it, const Value& dest,
+            const Value& addr, const TMU& tmu = TMU0, bool perLaneAddresses = false);
 
         /**
          * Lowers the intermediate TMU (cache) access instructions to the hardware instructions actually performed to

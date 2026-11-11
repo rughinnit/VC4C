@@ -439,6 +439,24 @@ static void propagateMergedWorkItemTypes(Method& method)
     CPPLOG_LAZY(logging::Level::DEBUG,
         log << "Vectorized " << numVectorized << " values derived from merged work-item IDs" << logging::endl);
 
+    /*
+     * Memory accesses with a per-lane address need to be handled specially when they are lowered. The address is
+     * stored in a pointer-typed local, which cannot be turned into a vector type (there are no vectors of pointers),
+     * so the per-lane-ness of the address would be lost otherwise. E.g. a per-lane read address allows performing a
+     * gather via TMU, one memory lookup per SIMD lane, instead of reading a single contiguous block.
+     */
+    method.forAllInstructions([&](const IntermediateInstruction& inst) {
+        auto mem = dynamic_cast<const MemoryInstruction*>(&inst);
+        if(mem == nullptr)
+            return;
+        // for a write, the destination is the address. For a copy, both sides are addresses
+        const bool perLaneAddress = mem->op == MemoryOperation::READ ?
+            isDivergent(mem->getSource()) :
+            (isDivergent(mem->getDestination()) || isDivergent(mem->getSource()));
+        if(perLaneAddress)
+            const_cast<MemoryInstruction*>(mem)->addDecorations(InstructionDecorations::PER_LANE_ADDRESS);
+    });
+
     // stores of a lane-invariant value into a lane-dependent address still need to write all lanes
     auto it = method.walkAllInstructions();
     while(!it.isEndOfMethod())
