@@ -1235,13 +1235,64 @@ static Optional<uint32_t> findFreeVPMRows(const std::vector<std::shared_ptr<VPMA
     return {};
 }
 
+/*
+ * The number of VPM rows of an area which is accessed with a per-QPU row offset, i.e. where the VPM row of an access is
+ * the base row of the area plus the number of the QPU executing it.
+ *
+ * Such an area must have one row for every QPU of the hardware, NOT only for the number of QPU instances the work-group
+ * is compiled for: the row offset is the hardware QPU number (see the REG_QPU_NUMBER register), which always is in the
+ * range [0, NUM_QPUS), independent of the work-group size. A compile-time work-group size (reqd_work_group_size) or a
+ * work-item merge factor only reduces how many QPUs the run-time has to use for the work-group, it does not renumber
+ * the QPUs - the hardware dispatches the queued instances to the QPUs with the highest numbers first, so e.g. a
+ * work-group compiled for 4 QPUs is executed by the QPUs 8 to 11.
+ *
+ * Reserving fewer rows than there are QPUs therefore makes the accesses of the higher-numbered QPUs point outside of
+ * the area. Once the row index leaves the 64-row QPU window (HW-2253), the QPU-side VPM access wraps around (the row
+ * field of the generic setup is 6 bits wide) while the DMA access does not (its row field is 7 bits wide), so a staged
+ * DMA store writes a different VPM row than the one the QPU wrote to, which silently stores stale data. Areas which are
+ * indexed by the QPU number must therefore always cover the whole QPU number range.
+ */
+static constexpr unsigned getPerQPUAreaRows()
+{
+    return NUM_QPUS;
+}
+
+/*
+ * Verifies that an area which is indexed by the QPU number can actually be addressed, and fails the compilation with a
+ * clear message instead of silently emitting code which writes to (or reads from) the wrong VPM row.
+ */
+static void checkPerQPUArea(const VPMArea& area)
+{
+    if(area.numRows < getPerQPUAreaRows())
+        throw CompilationError(CompilationStep::GENERAL,
+            "The per-QPU VPM area does not have a row for every QPU, so the QPUs with a higher number would access "
+            "memory outside of the area",
+            area.to_string());
+    if(static_cast<unsigned>(area.rowOffset) + static_cast<unsigned>(area.numRows) > VPM_NUM_ROWS)
+        throw CompilationError(CompilationStep::GENERAL,
+            "The per-QPU VPM area exceeds the 64 rows the QPUs can address (HW-2253)",
+            area.to_string());
+}
+
+LCOV_EXCL_START
+static void logPerQPUArea(const VPMArea& area, unsigned numQPUs)
+{
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Allocating " << static_cast<unsigned>(area.numRows) << " rows of "
+            << toUsageString(area.usageType, area.originalAddress) << " starting at row "
+            << static_cast<unsigned>(area.rowOffset) << " (rows[" << static_cast<unsigned>(area.rowOffset) << ", "
+            << static_cast<unsigned>(area.rowOffset) + static_cast<unsigned>(area.numRows) << "[) for one row per QPU, "
+            << numQPUs << " QPU instance(s)" << logging::endl);
+}
+LCOV_EXCL_STOP
+
 const VPMArea* VPM::getOrCreateStagingArea(const unsigned numQPUs)
 {
     if(stagingArea != nullptr)
         return stagingArea;
 
     // reserve one row per QPU, so every QPU can stage its DMA transfer without the need for the (global) hardware mutex
-    const auto numRows = static_cast<unsigned char>(std::min<unsigned>(std::max(numQPUs, 1u), VPM_NUM_ROWS));
+    const auto numRows = static_cast<unsigned char>(std::min<unsigned>(getPerQPUAreaRows(), VPM_NUM_ROWS));
     Optional<unsigned> rowOffset = findFreeVPMRows(areas, numRows);
     if(!rowOffset)
         // no more (big enough) free space in the VPM
@@ -1250,12 +1301,11 @@ const VPMArea* VPM::getOrCreateStagingArea(const unsigned numQPUs)
     auto ptr = std::make_shared<VPMArea>(VPMUsage::DMA_STAGING, static_cast<uint8_t>(rowOffset.value()), numRows,
         TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE),
         add_flag(VPMAreaAccessFlags::QPU_ACCESS_VECTOR_ALIGNED, VPMAreaAccessFlags::QPU_ACCESS_SINGLE_VECTOR));
+    checkPerQPUArea(*ptr);
     for(auto i = rowOffset.value(); i < (rowOffset.value() + numRows); ++i)
         areas[i] = ptr;
     stagingArea = ptr.get();
-    CPPLOG_LAZY(logging::Level::DEBUG,
-        log << "Allocating " << static_cast<unsigned>(numRows) << " rows of VPM DMA staging area starting at row "
-            << rowOffset.value() << " for " << numQPUs << " QPUs" << logging::endl);
+    logPerQPUArea(*ptr, numQPUs);
     PROFILE_COUNTER(vc4c::profiler::COUNTER_GENERAL, "VPM DMA staging rows", numRows);
     return stagingArea;
 }
@@ -1428,21 +1478,23 @@ const VPMArea* VPM::addCacheArea(const Local& baseAddress, DataType elementType,
 
 const VPMArea* VPM::addSpillArea(unsigned numQPUs)
 {
-    Optional<unsigned> rowOffset = findFreeVPMRows(areas, numQPUs);
+    // The spill area is also indexed by the hardware QPU number (see #getPerQPUAreaRows()), so it needs one row per QPU
+    // and not only one row per QPU instance of the work-group.
+    const auto numRows = static_cast<unsigned char>(std::min<unsigned>(getPerQPUAreaRows(), VPM_NUM_ROWS));
+    Optional<unsigned> rowOffset = findFreeVPMRows(areas, numRows);
     if(!rowOffset)
         // no more (big enough) free space on VPM
         return nullptr;
 
     // for now align all new VPM areas at the beginning of a row
-    auto ptr = std::make_shared<VPMArea>(VPMUsage::REGISTER_SPILLING, static_cast<uint8_t>(rowOffset.value()), numQPUs,
+    auto ptr = std::make_shared<VPMArea>(VPMUsage::REGISTER_SPILLING, static_cast<uint8_t>(rowOffset.value()), numRows,
         TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE),
         add_flag(VPMAreaAccessFlags::QPU_ACCESS_FULL_VECTOR, VPMAreaAccessFlags::QPU_ACCESS_SINGLE_VECTOR));
-    for(auto i = rowOffset.value(); i < (rowOffset.value() + numQPUs); ++i)
+    checkPerQPUArea(*ptr);
+    for(auto i = rowOffset.value(); i < (rowOffset.value() + numRows); ++i)
         areas[i] = ptr;
-    CPPLOG_LAZY(logging::Level::DEBUG,
-        log << "Allocating " << numQPUs << " rows of VPM spill cache starting at row " << rowOffset.value()
-            << logging::endl);
-    PROFILE_COUNTER(vc4c::profiler::COUNTER_GENERAL, "VPM spill register rows", numQPUs);
+    logPerQPUArea(*ptr, numQPUs);
+    PROFILE_COUNTER(vc4c::profiler::COUNTER_GENERAL, "VPM spill register rows", numRows);
     return ptr.get();
 }
 
@@ -1569,6 +1621,25 @@ void VPM::dumpUsage() const
         if(numEmpty > 0)
             writeArea(stream, "", (numEmpty * outputWidth) / VPM_NUM_ROWS);
         stream << logging::endl;
+
+        /*
+         * Additionally list every area with its row range. This is the layout a debugging session needs: no two areas
+         * may share a row and no area may leave the 64 rows the QPUs can address (HW-2253). Areas which are accessed
+         * with a per-QPU row offset (DMA staging, register spilling) need one row for every QPU, since their row offset
+         * is the hardware QPU number, see #getPerQPUAreaRows().
+         */
+        lastArea = nullptr;
+        for(const auto& area : areas)
+        {
+            if(!area || area == lastArea)
+                continue;
+            lastArea = area;
+            logging::debug() << "  rows[" << static_cast<unsigned>(area->rowOffset) << ", "
+                             << static_cast<unsigned>(area->rowOffset) + static_cast<unsigned>(area->numRows) << "[ ("
+                             << static_cast<unsigned>(area->numRows) << " rows): "
+                             << toUsageString(area->usageType, area->originalAddress) << " with "
+                             << area->elementType.to_string() << " elements" << logging::endl;
+        }
     });
 }
 LCOV_EXCL_STOP

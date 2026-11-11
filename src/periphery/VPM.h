@@ -907,6 +907,11 @@ namespace vc4c
              * Returns (and if necessary, allocates) the area of the VPM used to stage the DMA transfers between the QPUs
              * and RAM, with one row reserved for every QPU.
              *
+             * The row of an access is the hardware QPU number, which is independent of the number of QPU instances the
+             * work-group is compiled for, so the area always reserves one row for every QPU of the hardware (and not
+             * only for the number of instances the given work-group can occupy). The number of instances is only used
+             * for logging.
+             *
              * Returns nullptr, if there is not enough free space left in the VPM to reserve the rows.
              */
             const VPMArea* getOrCreateStagingArea(unsigned numQPUs);
@@ -916,6 +921,13 @@ namespace vc4c
             const VPMArea* addSharedArea(const Local& baseAddress, DataType elementType, uint32_t numElements,
                 VPMAreaAccessFlags flags = VPMAreaAccessFlags::NONE);
             const VPMArea* addCacheArea(const Local& baseAddress, DataType elementType, uint32_t numElements);
+            /*
+             * Allocates a VPM area for register spilling, with one row reserved for every QPU.
+             *
+             * As for the DMA staging area, the row of an access is the hardware QPU number, so the area must cover all
+             * QPUs of the hardware, not only the QPU instances the work-group is compiled for. The number of instances
+             * is only used for logging.
+             */
             const VPMArea* addSpillArea(unsigned numQPUs = NUM_QPUS);
 
             /*
