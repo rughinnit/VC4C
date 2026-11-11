@@ -113,7 +113,12 @@ namespace vc4c
             // Value indicating the set built-in flag is present in the Z-dimension (2nd)
             DIMENSION_Z = 1u << 29u,
             // Value indicating the set built-in flag is scalar (added up across all dimensions)
-            DIMENSION_SCALAR = 1u << 30u
+            DIMENSION_SCALAR = 1u << 30u,
+            // The instruction reads a value from an address which is identical for all merged work-items, so a single
+            // lookup returns the value for every SIMD lane. This is needed if the loaded value is used per work-item
+            // (i.e. its destination is a per-lane value), since then the number of elements of the destination does not
+            // match the number of elements to be loaded
+            BROADCAST_READ = 1u << 31u
         };
 
         std::string toString(InstructionDecorations decoration);

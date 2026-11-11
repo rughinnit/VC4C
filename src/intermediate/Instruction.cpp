@@ -80,6 +80,8 @@ std::string intermediate::toString(const InstructionDecorations decoration)
         res.append("Z ");
     if(has_flag(decoration, InstructionDecorations::DIMENSION_SCALAR))
         res.append("XYZ ");
+    if(has_flag(decoration, InstructionDecorations::BROADCAST_READ))
+        res.append("broadcast ");
     return res.substr(0, res.empty() ? 0 : res.size() - 1);
 }
 LCOV_EXCL_STOP

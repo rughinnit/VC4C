@@ -777,6 +777,10 @@ NODISCARD static InstructionWalker findGroupOfTMUAccess(InstructionWalker it, TM
                 if(tmuCacheEntry->perLaneAddresses)
                     // a gather uses the per-lane addresses verbatim, combining it with other reads would overwrite them
                     return it.nextInBlock();
+                if(tmuCacheEntry->laneUniformAddress)
+                    // a broadcast reads a single lane-uniform address, combining it with other reads would calculate
+                    // consecutive addresses instead
+                    return it.nextInBlock();
 
                 auto cacheReadInst = tmuCacheEntry->getCacheReader();
                 auto cacheReadIt = cacheReadInst ?
@@ -1422,6 +1426,9 @@ static FastMap<TypedInstructionWalker<intermediate::RAMAccessInstruction>, TMULo
                 auto cacheEntry = ramAccess->getTMUCacheEntry();
                 if(cacheEntry->perLaneAddresses)
                     // the per-lane address calculation of a gather stays within the loop and cannot be prefetched
+                    continue;
+                if(cacheEntry->laneUniformAddress)
+                    // the value of a broadcast is the same for all lanes, there is nothing to prefetch for it
                     continue;
                 ++numTMULoads[cacheEntry->getTMUIndex()];
 
