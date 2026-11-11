@@ -620,7 +620,8 @@ static InstructionWalker loadMemoryViaTMU(Method& method, InstructionWalker it, 
         }
         // prefer TMU1 here, since statistically TMU0 will be used more often
         const auto& tmu = numTMU0 > numTMU1 ? periphery::TMU0 : periphery::TMU1;
-        it = periphery::insertReadVectorFromTMU(method, it, mem->getDestination(), mem->getSource(), tmu);
+        it = periphery::insertReadVectorFromTMU(method, it, mem->getDestination(), mem->getSource(), tmu,
+            mem->hasDecoration(intermediate::InstructionDecorations::PER_LANE_ADDRESS));
         return it.erase();
     }
     throw CompilationError(CompilationStep::NORMALIZER, "Unhandled case to read from memory via TMU", mem->to_string());

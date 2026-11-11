@@ -147,6 +147,13 @@ static int calculateCostsVsBenefits(const ControlFlowLoop& loop, const Induction
                     // would no longer fit in the caches.
                     if(auto tmuCacheEntry = access->getTMUCacheEntry())
                     {
+                        if(tmuCacheEntry->perLaneAddresses)
+                        {
+                            CPPLOG_LAZY(logging::Level::DEBUG,
+                                log << "Cannot vectorize loop containing a gather of per-lane addresses: "
+                                    << it->to_string() << logging::endl);
+                            return std::numeric_limits<int>::min();
+                        }
                         if(isDynamicIterationCount && tmuCacheEntry->numVectorElements != 1_val)
                         {
                             CPPLOG_LAZY(logging::Level::DEBUG,

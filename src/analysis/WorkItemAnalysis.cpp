@@ -749,11 +749,84 @@ namespace
     }
 
     /*
-     * The memory lowering always transfers a single contiguous block of elements starting at the address calculated
-     * for the first work-item of the merged group (the work-items are consecutive along dimension 0, so this is the
-     * first SIMD lane). Thus, a memory access at a lane-dependent address is only correct if the address advances by
-     * exactly one accessed element per work-item. Anything else (strided accesses, gathers, ...) cannot be expressed
-     * by the hardware and would silently read/write the wrong elements.
+     * Determines the memory area (e.g. the kernel parameter) the given memory address refers to.
+     */
+    static const Local* getMemoryObject(const Value& address)
+    {
+        auto local = address.checkLocal();
+        return local != nullptr ? local->getBase(true) : nullptr;
+    }
+
+    /*
+     * Checks whether the given memory area is only read from, i.e. whether no instruction writes to it.
+     *
+     * This follows all locals derived from the given local (e.g. for address calculations), since a memory write is
+     * expressed as a write to the address local used as instruction destination.
+     *
+     * Only such memory can be read via TMU, memory which is written to is accessed via VPM instead (see the memory
+     * access mapping).
+     */
+    static bool isReadOnlyMemory(const Local* memoryObject)
+    {
+        FastSet<const Local*> closed;
+        FastSet<const Local*> open{memoryObject};
+        while(!open.empty())
+        {
+            auto local = *open.begin();
+            open.erase(open.begin());
+            closed.emplace(local);
+
+            bool isWrittenTo = false;
+            local->forUsers(LocalUse::Type::WRITER, [&](const LocalUser* writer) {
+                if(dynamic_cast<const intermediate::MemoryInstruction*>(writer) != nullptr)
+                    isWrittenTo = true;
+            });
+            if(isWrittenTo)
+                return false;
+
+            local->forUsers(LocalUse::Type::READER, [&](const LocalUser* reader) {
+                if(dynamic_cast<const intermediate::MemoryInstruction*>(reader) != nullptr)
+                    // the read value or the copied-from address does not lead to another address of this memory area
+                    return;
+                if(auto out = reader->checkOutputLocal())
+                {
+                    if(closed.find(out) == closed.end())
+                        open.emplace(out);
+                }
+            });
+        }
+        return true;
+    }
+
+    /*
+     * Checks whether reads from the given memory address are lowered to TMU lookups (which can access one address per
+     * SIMD lane, i.e. gather arbitrary elements) instead of VPM/DMA transfers (which transfer a single contiguous
+     * block of elements) or register accesses.
+     *
+     * This is the case for read-only kernel parameters in global or constant address space.
+     */
+    static bool isReadViaTMU(const Value& address)
+    {
+        const auto* memoryObject = getMemoryObject(address);
+        const auto* param = memoryObject != nullptr ? memoryObject->as<Parameter>() : nullptr;
+        const auto* pointerType = param != nullptr ? param->type.getPointerType() : nullptr;
+        if(pointerType == nullptr)
+            return false;
+        if(pointerType->addressSpace != AddressSpace::GLOBAL && pointerType->addressSpace != AddressSpace::CONSTANT)
+            return false;
+        return isReadOnlyMemory(memoryObject);
+    }
+
+    /*
+     * The memory lowering of writes always transfers a single contiguous block of elements starting at the address
+     * calculated for the first work-item of the merged group (the work-items are consecutive along dimension 0, so this
+     * is the first SIMD lane). Thus, a write at a lane-dependent address is only correct if the address advances by
+     * exactly one accessed element per work-item. Anything else (strided accesses, scatters, ...) cannot be expressed
+     * by the hardware and would silently write the wrong elements.
+     *
+     * For reads, the address can instead be a per-SIMD-lane vector (see #insertReadVectorFromTMU()), i.e. a gather of
+     * arbitrary elements. This is supported for memory read via TMU, but not for memory accessed via VPM/DMA (which
+     * only transfers contiguous blocks) or for constant memory lowered into registers.
      */
     static std::string checkLaneDependentMemoryAccesses(const Method& method, LaneStepAnalysis& laneSteps)
     {
@@ -788,6 +861,9 @@ namespace
             const auto elementBytes = getAccessedElementBytes(*mem);
             if(!addressStep.known || elementBytes <= 0 || addressStep.step != elementBytes)
             {
+                if(!isWrite && isReadViaTMU(mem->getSource()))
+                    // the read address is lowered to a per-SIMD-lane TMU address vector, which performs a gather
+                    return;
                 reason = "accesses memory at a lane-dependent address which does not advance by exactly one element "
                          "per work-item: " +
                     mem->to_string();
