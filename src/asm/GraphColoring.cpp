@@ -417,8 +417,6 @@ static void fixLocals(const InstructionWalker it, FastMap<const Local*, LocalUsa
 GraphColoring::GraphColoring(Method& method, InstructionWalker it) :
     method(method), closedSet(), openSet(), livenessAnalysis(true), localUses()
 {
-    closedSet.reserve(method.getNumLocals());
-    openSet.reserve(method.getNumLocals());
     localUses.reserve(method.getNumLocals());
 
     const Local* lastWrittenLocal0 = nullptr;
@@ -670,8 +668,8 @@ void GraphColoring::createGraph()
 #endif
 }
 
-static void processClosedSet(ColoredGraph& graph, FastSet<const Local*>& closedSet, FastSet<const Local*>& openSet,
-    FastSet<const Local*>& errorSet)
+static void processClosedSet(ColoredGraph& graph, SortedSet<const Local*, LocalIdGreater>& closedSet,
+    SortedSet<const Local*, LocalIdGreater>& openSet, SortedSet<const Local*, LocalIdGreater>& errorSet)
 {
     PROFILE_SCOPE(processClosedSet);
     while(!closedSet.empty())

@@ -528,7 +528,9 @@ bool LocalUtilization::operator<(const LocalUtilization& other) const noexcept
         return true;
     if(numAccesses > other.numAccesses)
         return false;
-    return local < other.local;
+    // NOTE: Use the deterministic local identifier instead of the memory address as tie-breaker, otherwise the order
+    // of the locals (and therefore the generated code) would depend on the memory layout of the compiler process.
+    return local->id < other.local->id;
 }
 
 LCOV_EXCL_START

@@ -19,6 +19,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <queue>
 #include <set>
@@ -284,9 +285,36 @@ std::size_t optimizations::moveLoopInvariantCode(const Module& module, Method& m
     if(cfg.getNodes().empty())
         return numChanges;
 
+    // The loops and the nodes inside of them are stored in pointer-keyed containers. To not let the order of the
+    // memory layout decide in which order the loop-invariant instructions are hoisted (which changes the register
+    // pressure and therefore the generated code), all iterations below use the (deterministic) order of the basic
+    // blocks in the method.
+    FastMap<const BasicBlock*, std::size_t> blockOrder;
+    {
+        std::size_t index = 0;
+        for(auto& block : method)
+            blockOrder.emplace(&block, index++);
+    }
+    const auto getNodeOrder = [&blockOrder](const CFGNode* node) -> std::size_t {
+        auto it = node ? blockOrder.find(node->key) : blockOrder.end();
+        return it == blockOrder.end() ? std::numeric_limits<std::size_t>::max() : it->second;
+    };
+    const auto getLoopOrder = [&getNodeOrder](const ControlFlowLoop* loop) -> std::size_t {
+        return loop ? getNodeOrder(loop->getHeader()) : std::numeric_limits<std::size_t>::max();
+    };
+
     // 2. Find loops
     auto dominatorTree = cfg.getDominatorTree();
     auto loops = cfg.findLoops(true, true);
+    // sort the loops by the position of their header block to iterate over them in a deterministic order
+    FastAccessList<const ControlFlowLoop*> orderedLoops;
+    orderedLoops.reserve(loops.size());
+    for(const auto& loop : loops)
+        orderedLoops.emplace_back(&loop);
+    std::stable_sort(orderedLoops.begin(), orderedLoops.end(),
+        [&getLoopOrder](const ControlFlowLoop* left, const ControlFlowLoop* right) {
+            return getLoopOrder(left) < getLoopOrder(right);
+        });
 
     // 3. Generate inclusion relation of loops as trees
     auto inclusionTree = createLoopInclusionTree(loops);
@@ -307,11 +335,15 @@ std::size_t optimizations::moveLoopInvariantCode(const Module& module, Method& m
     }
 
     // find instructions to be moved
-    for(auto& loop : inclusionTree->getNodes())
+    for(auto* loop : orderedLoops)
     {
-        auto& node = inclusionTree->getOrCreateNode(loop.first);
-        auto& loopHeaderDominatorNode = dominatorTree->assertNode(loop.first->getHeader());
-        for(auto& cfgNode : *node.key)
+        auto& node = inclusionTree->getOrCreateNode(loop);
+        auto& loopHeaderDominatorNode = dominatorTree->assertNode(loop->getHeader());
+        // iterate the nodes of this loop in a deterministic order (see above)
+        std::vector<const CFGNode*> loopNodes(node.key->begin(), node.key->end());
+        std::stable_sort(loopNodes.begin(), loopNodes.end(),
+            [&getNodeOrder](const CFGNode* left, const CFGNode* right) { return getNodeOrder(left) < getNodeOrder(right); });
+        for(auto* cfgNode : loopNodes)
         {
             if(node.hasCFGNodeInChildren(cfgNode))
             {
@@ -340,7 +372,7 @@ std::size_t optimizations::moveLoopInvariantCode(const Module& module, Method& m
                         // the dominator check is required to not hoist the instruction above its writer
                         auto& blockDominatorNode = dominatorTree->assertNode(&cfg.assertNode(sourceBlockIt->second));
                         if(loopHeaderDominatorNode.isDominatedBy(blockDominatorNode) &&
-                            std::none_of(loop.first->begin(), loop.first->end(), [&](const CFGNode* loopNode) -> bool {
+                            std::none_of(loop->begin(), loop->end(), [&](const CFGNode* loopNode) -> bool {
                                 return loopNode->key == sourceBlockIt->second;
                             }))
                             return true;
@@ -393,9 +425,9 @@ std::size_t optimizations::moveLoopInvariantCode(const Module& module, Method& m
     FastSet<const IntermediateInstruction*> processedInsts;
 
     // move instructions
-    for(auto& loop : inclusionTree->getNodes())
+    for(auto* loop : orderedLoops)
     {
-        auto& node = inclusionTree->getOrCreateNode(loop.first);
+        auto& node = inclusionTree->getOrCreateNode(loop);
         auto root = castToTreeNode(node.findRoot({}));
 
         if(processedNodes.find(root) != processedNodes.end())
@@ -412,11 +444,20 @@ std::size_t optimizations::moveLoopInvariantCode(const Module& module, Method& m
             queue.pop();
             auto targetLoop = currentNode->key;
 
+            // push the child nodes in a deterministic order, since it decides in which order the loop-invariant
+            // instructions are inserted into the (possibly shared) pre-header blocks
+            std::vector<LoopInclusionTreeNode*> children;
             currentNode->forAllOutgoingEdges(
-                [&](const LoopInclusionTreeNode& child, const LoopInclusionTreeEdge&) -> bool {
-                    queue.push(const_cast<LoopInclusionTreeNode*>(&child));
+                [&children](const LoopInclusionTreeNode& child, const LoopInclusionTreeEdge&) -> bool {
+                    children.emplace_back(const_cast<LoopInclusionTreeNode*>(&child));
                     return true;
                 });
+            std::stable_sort(children.begin(), children.end(),
+                [&getLoopOrder](const LoopInclusionTreeNode* left, const LoopInclusionTreeNode* right) {
+                    return getLoopOrder(left->key) < getLoopOrder(right->key);
+                });
+            for(auto* child : children)
+                queue.push(child);
 
             auto insts = instMapper.find(currentNode);
             if(insts == instMapper.end())
@@ -590,7 +631,8 @@ using BasicBlockIterator = decltype(std::declval<Method>().begin());
 
 static std::size_t reorderNode(Method& method, const DominatorTreeNode& node,
     const FastMap<const BasicBlock*, BasicBlockIterator>& blockIterators, BasicBlockIterator& insertIt,
-    const FastMap<const CFGNode*, std::size_t>& visitedNodes)
+    const FastMap<const CFGNode*, std::size_t>& visitedNodes,
+    const FastMap<const BasicBlock*, std::size_t>& blockPositions)
 {
     auto blockIt = blockIterators.at(node.key->key);
     std::size_t numChanges = 0;
@@ -609,15 +651,19 @@ static std::size_t reorderNode(Method& method, const DominatorTreeNode& node,
         sortedSuccessors.emplace_back(&successor, visitedNodes.at(successor.key));
         return true;
     });
-    std::sort(sortedSuccessors.begin(), sortedSuccessors.end(), [](const auto& one, const auto& other) {
+    std::sort(sortedSuccessors.begin(), sortedSuccessors.end(), [&blockPositions](const auto& one, const auto& other) {
         // prefer children/successors with a smaller sub-tree over larger sub-trees, mainly to keep small loops
         // together
-        return one.second < other.second || (one.second == other.second && one.first->key->key < other.first->key->key);
+        // NOTE: The tie-breaker uses the original position of the blocks and not their memory address, since the
+        // order of the blocks (and therefore the generated code) would otherwise depend on the memory layout
+        return one.second < other.second ||
+            (one.second == other.second &&
+                blockPositions.at(one.first->key->key) < blockPositions.at(other.first->key->key));
     });
 
     for(auto& successor : sortedSuccessors)
         // run this reordering recursively to keep all (small) sub-trees together and not interleave them
-        numChanges += reorderNode(method, *successor.first, blockIterators, insertIt, visitedNodes);
+        numChanges += reorderNode(method, *successor.first, blockIterators, insertIt, visitedNodes, blockPositions);
 
     return numChanges;
 };
@@ -630,19 +676,39 @@ std::size_t optimizations::reorderBasicBlocks(const Module& module, Method& meth
 
     std::size_t numChanges = 0;
 
+    // the original position of the blocks, to order all pointer-keyed containers by it instead of by memory address
+    FastMap<const BasicBlock*, std::size_t> blockPositions;
+    {
+        std::size_t index = 0;
+        for(auto& block : method)
+            blockPositions.emplace(&block, index++);
+    }
+    const auto getBlockPosition = [&blockPositions](const CFGNode* node) -> std::size_t {
+        auto it = node ? blockPositions.find(node->key) : blockPositions.end();
+        return it == blockPositions.end() ? std::numeric_limits<std::size_t>::max() : it->second;
+    };
+
     // 1. create and walk dominator tree to determine length of dominator sub-paths
     FastMap<const CFGNode*, std::size_t> visitedNodes;
     auto dominatorTree = cfg.getDominatorTree();
     std::queue<const DominatorTreeNode*> openNodes;
+    std::vector<const DominatorTreeNode*> sinks;
     dominatorTree->forAllSinks([&](const DominatorTreeNode& node) {
-        visitedNodes[node.key] = node.key->isSink() ? cfg.getNodes().size() : 1;
-        if(auto dominator = node.getSinglePredecessor())
-        {
-            visitedNodes[dominator->key] = std::max(visitedNodes[dominator->key], visitedNodes[node.key] + 1);
-            openNodes.emplace(dominator);
-        }
+        sinks.emplace_back(&node);
         return true;
     });
+    std::sort(sinks.begin(), sinks.end(), [&getBlockPosition](const DominatorTreeNode* left, const DominatorTreeNode* right) {
+        return getBlockPosition(left->key) < getBlockPosition(right->key);
+    });
+    for(const auto* sink : sinks)
+    {
+        visitedNodes[sink->key] = sink->key->isSink() ? cfg.getNodes().size() : 1;
+        if(auto dominator = sink->getSinglePredecessor())
+        {
+            visitedNodes[dominator->key] = std::max(visitedNodes[dominator->key], visitedNodes[sink->key] + 1);
+            openNodes.emplace(dominator);
+        }
+    }
 
     while(!openNodes.empty())
     {
@@ -662,10 +728,16 @@ std::size_t optimizations::reorderBasicBlocks(const Module& module, Method& meth
 
     // 3. reorder the blocks according to the determined order
     auto insertIt = method.begin();
+    std::vector<const DominatorTreeNode*> sources;
     dominatorTree->forAllSources([&](const DominatorTreeNode& node) {
-        numChanges += reorderNode(method, node, blockIterators, insertIt, visitedNodes);
+        sources.emplace_back(&node);
         return true;
     });
+    std::sort(sources.begin(), sources.end(), [&getBlockPosition](const DominatorTreeNode* left, const DominatorTreeNode* right) {
+        return getBlockPosition(left->key) < getBlockPosition(right->key);
+    });
+    for(const auto* source : sources)
+        numChanges += reorderNode(method, *source, blockIterators, insertIt, visitedNodes, blockPositions);
 
     // 4. fix-up wrong fall-through in now reordered blocks
     auto blockIt = method.begin();

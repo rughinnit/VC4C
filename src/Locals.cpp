@@ -8,6 +8,8 @@
 
 #include "intermediate/IntermediateInstruction.h"
 
+#include <atomic>
+
 using namespace vc4c;
 
 LocalData::~LocalData() noexcept = default;
@@ -17,7 +19,13 @@ std::string LocalData::to_string() const
     return "";
 }
 
-Local::Local(DataType type, const std::string& name) : type(type), name(name) {}
+namespace
+{
+    // process-wide counter for the unique local identifiers, see Local::id
+    std::atomic<std::size_t> nextLocalId{0};
+} // namespace
+
+Local::Local(DataType type, const std::string& name) : type(type), name(name), id(nextLocalId.fetch_add(1)) {}
 
 bool Local::operator<(const Local& other) const noexcept
 {
