@@ -26,6 +26,8 @@
 
 #include "log.h"
 
+#include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -326,7 +328,9 @@ void Normalizer::adjust(Module& module, const std::set<std::string>& selectedSte
  * operations). The check-work-item-merging analysis guarantees that no other instruction writes a lane-dependent value
  * from lane-invariant operands, so the warning below is only a safety net.
  */
-static void replicateLaneInvariantOperands(InstructionWalker it, Method& method)
+static void replicateLaneInvariantOperands(InstructionWalker it, Method& method,
+    const FastSet<const Local*>& divergent, const FastSet<const Local*>& lanePartial,
+    std::map<const Local*, Value>& replicationCache)
 {
     auto* inst = it.get();
     if(it.get<intermediate::MoveOperation>() == nullptr && it.get<intermediate::Operation>() == nullptr)
@@ -344,10 +348,33 @@ static void replicateLaneInvariantOperands(InstructionWalker it, Method& method)
         if(arg.getConstantValue(true) || !arg.type.isSimpleType() || arg.type.getVectorWidth() > 1)
             // constants and already vectorized values are implicitly per-lane
             continue;
-        const Value replicated = method.addNewLocal(arg.type.toVectorType(NATIVE_VECTOR_SIZE), "%merged_value");
+        const auto source = arg.checkLocal();
+        if(source != nullptr && lanePartial.find(source) == lanePartial.end() &&
+            divergent.find(source) == divergent.end())
+            // the value is lane-invariant and its producer writes all SIMD lanes, so it is already present in every
+            // lane. Special registers are handled below, since they are not written by an instruction at all
+            continue;
+        const auto vectorType = arg.type.toVectorType(NATIVE_VECTOR_SIZE);
+        /*
+         * Reuse the replication of a local which already happened in this basic block. The cached local lives in a
+         * normal register, so it stays valid until the source is written or the block ends; both cases invalidate the
+         * cache in propagateMergedWorkItemTypes().
+         */
+        if(source != nullptr)
+        {
+            const auto cached = replicationCache.find(source);
+            if(cached != replicationCache.end() && cached->second.type == vectorType)
+            {
+                inst->setArgument(i, cached->second);
+                continue;
+            }
+        }
+        const Value replicated = method.addNewLocal(vectorType, "%merged_value");
         auto insertionPoint = position.copy();
         ignoreReturnValue(intermediate::insertReplication(insertionPoint, arg, replicated));
         inst->setArgument(i, replicated);
+        if(source != nullptr)
+            replicationCache.emplace(source, replicated);
     }
 }
 
@@ -508,15 +535,99 @@ static void propagateMergedWorkItemTypes(Method& method)
      * must be replicated to all lanes as well. This e.g. covers the very common case of a value read from a
      * work-group-uniform (e.g. __local) address being combined with a per-work-item value.
      */
+
+    /*
+     * The intermediate code declares the lane-invariant values as scalars, but that does not mean that their register
+     * only holds a value in the first SIMD lane. A scalar value loaded from memory only contains the element of the
+     * first lane, since the memory lowering performs a single lookup for it. Every other instruction writes all SIMD
+     * lanes with the result of the corresponding lane, so the value of a local whose producer is not such a load is
+     * already present in all lanes and replicating it would be a no-op. Collect those values which might really only
+     * be valid in the first lane; everything else does not need to be replicated.
+     */
+    FastSet<const Local*> lanePartial;
+    method.forAllInstructions([&](const IntermediateInstruction& inst) {
+        auto out = inst.getOutput();
+        auto loc = out ? out->checkLocal() : nullptr;
+        if(loc == nullptr || !loc->type.isSimpleType() || loc->type.getVectorWidth() > 1)
+            return;
+        const auto* mem = dynamic_cast<const MemoryInstruction*>(&inst);
+        const auto* move = dynamic_cast<const MoveOperation*>(&inst);
+        const auto* operation = dynamic_cast<const Operation*>(&inst);
+        bool partial = mem != nullptr && mem->op == MemoryOperation::READ;
+        if(operation != nullptr)
+            partial = partial || static_cast<bool>(inst.getVectorRotation());
+        else if(move == nullptr)
+            // unknown instruction, do not assume anything about the written lanes
+            partial = true;
+        if(!partial)
+            // a value calculated from a lane-dependent special register (e.g. the SIMD lane index) is not valid in
+            // all lanes either. Such a register is not written by an instruction, so it does not need to be tracked
+            // as a partial value, it is simply never assumed to be identical in all lanes
+            for(const auto& arg : inst.getArguments())
+            {
+                if(arg.checkLocal() == nullptr && !arg.isAllSame())
+                {
+                    partial = true;
+                    break;
+                }
+            }
+        if(partial)
+            lanePartial.emplace(loc);
+    });
+    /*
+     * A value calculated from a value which is only valid in the first lane is only valid there as well. The same
+     * applies to a scalar extracted from a vector: the SIMD lanes of a vector hold different elements, so reading a
+     * single element of it does not yield a value which is valid in all lanes.
+     */
+    bool partialChanged = true;
+    while(partialChanged)
+    {
+        partialChanged = false;
+        method.forAllInstructions([&](const IntermediateInstruction& inst) {
+            auto out = inst.getOutput();
+            auto loc = out ? out->checkLocal() : nullptr;
+            if(loc == nullptr || !loc->type.isSimpleType() || loc->type.getVectorWidth() > 1 ||
+                lanePartial.find(loc) != lanePartial.end())
+                return;
+            const auto& args = inst.getArguments();
+            const bool fromPartial = std::any_of(args.begin(), args.end(), [&](const Value& arg) {
+                if(arg.type.getVectorWidth() > 1)
+                    return true;
+                const auto argLoc = arg.checkLocal();
+                return argLoc != nullptr && lanePartial.find(argLoc) != lanePartial.end();
+            });
+            if(fromPartial && lanePartial.emplace(loc).second)
+                partialChanged = true;
+        });
+    }
+
+    /*
+     * Replicating a lane-invariant operand writes the special replicate register which is read back as the replicated
+     * value, so it is a real instruction in the generated kernel. The same value is normally used by many instructions
+     * of the same basic block (e.g. the divisor of a run-time division which is expanded into a long sequence of
+     * clamping operations), so replicating it once per use is redundant. The replicated value is a normal local, so it
+     * can be reused until the source is written or the basic block ends (the source may be assigned on another
+     * control-flow path).
+     */
+    std::map<const Local*, Value> replicationCache;
+    const BasicBlock* replicationCacheBlock = nullptr;
     it = method.walkAllInstructions();
     while(!it.isEndOfMethod())
     {
+        if(it.getBasicBlock() != replicationCacheBlock)
+        {
+            replicationCache.clear();
+            replicationCacheBlock = it.getBasicBlock();
+        }
         if(!it.isEndOfBlock())
         {
             auto out = it->getOutput();
             auto loc = out ? out->checkLocal() : nullptr;
+            // writing a local invalidates the cached replication of its previous value
+            if(loc != nullptr)
+                replicationCache.erase(loc);
             if(loc != nullptr && divergent.find(loc) != divergent.end() && loc->type.getVectorWidth() > 1)
-                replicateLaneInvariantOperands(it, method);
+                replicateLaneInvariantOperands(it, method, divergent, lanePartial, replicationCache);
         }
         it.nextInMethod();
     }
