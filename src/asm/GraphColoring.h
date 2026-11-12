@@ -157,14 +157,17 @@ namespace vc4c
 
         private:
             Method& method;
-            FastSet<const Local*> closedSet;
-            FastSet<const Local*> openSet;
+            // NOTE: These sets are iterated in the order their elements are taken from. Since the order of the locals
+            // decides which register file each local is assigned to (and therefore which machine code is generated),
+            // they are ordered by the deterministic local identifier instead of the (ASLR-dependent) memory address.
+            SortedSet<const Local*, LocalIdGreater> closedSet;
+            SortedSet<const Local*, LocalIdGreater> openSet;
             analysis::GlobalLivenessAnalysis livenessAnalysis;
             std::unique_ptr<analysis::InterferenceGraph> interferenceGraph;
             FastMap<const Local*, LocalUsage> localUses;
 
             ColoredGraph graph;
-            FastSet<const Local*> errorSet;
+            SortedSet<const Local*, LocalIdGreater> errorSet;
 
             void createGraph();
             void resetGraph();

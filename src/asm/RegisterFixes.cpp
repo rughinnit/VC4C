@@ -17,6 +17,9 @@
 #include "../periphery/VPM.h"
 #include "GraphColoring.h"
 
+#include <algorithm>
+#include <array>
+
 using namespace vc4c;
 using namespace vc4c::qpu_asm;
 using namespace vc4c::operators;
@@ -107,6 +110,201 @@ static bool isUsedAsSplatValue(const Local* loc)
     return false;
 }
 
+namespace
+{
+    /*
+     * The element groupings created by groupScalarLocals()/groupParameters() pack a scalar value into a single SIMD
+     * element of a vector. Inserting an element is only possible by writing conditionally with the SIMD-element flags
+     * set by a comparison against the element-number register. Since setting those flags overwrites all previously
+     * calculated flags, such an insertion must never be placed in the "shadow" of a preceding comparison - otherwise
+     * the following conditional instructions silently use the element mask as their condition and the generated code
+     * computes garbage.
+     */
+
+    /*
+     * Returns whether the flags calculated before the given position are still read by one of the instructions behind
+     * it.
+     *
+     * NOTE: Flag chains do not cross basic block boundaries in the intermediate representation (a conditional branch
+     * consumes the flags at the end of its block), so the end of the block is treated as the flags being dead.
+     */
+    bool flagsAreLive(InstructionWalker it)
+    {
+        for(; !it.isEndOfBlock(); it.nextInBlock())
+        {
+            if(!it.has())
+                continue;
+            if(it->hasConditionalExecution())
+                // this instruction reads the flags (even if it also sets them)
+                return true;
+            if(it->doesSetFlag())
+                // the flags are overwritten before they are read
+                return false;
+        }
+        return false;
+    }
+
+    /*
+     * Returns the next position behind the given one at which the flags calculated in front of it are not read anymore,
+     * or no value if there is no such position within the same basic block.
+     *
+     * This is the position in front of the first instruction setting flags without reading them. That instruction
+     * overwrites the flags anyway, so no instruction in front of it is affected by an insertion at that position. A
+     * branch terminates the search unsuccessfully, since it may read the flags and we must not insert behind it.
+     */
+    Optional<InstructionWalker> findFlagsDeadPosition(InstructionWalker it)
+    {
+        for(; !it.isEndOfBlock(); it.nextInBlock())
+        {
+            if(!it.has())
+                continue;
+            if(it->doesSetFlag() && !it->hasConditionalExecution())
+                return it;
+            if(dynamic_cast<const intermediate::Branch*>(it.get()))
+                return {};
+        }
+        return {};
+    }
+
+    /**
+     * Returns the SIMD element selected by the given instruction, if it is the comparison of the element-number
+     * register against a constant as created by `selectSIMDElement()`.
+     */
+    Optional<uint8_t> getSelectedSIMDElement(const intermediate::IntermediateInstruction& instr)
+    {
+        if(!instr.doesSetFlag())
+            return {};
+        if(auto op = dynamic_cast<const intermediate::Operation*>(&instr))
+        {
+            if(op->op != OP_XOR)
+                return {};
+            Optional<Value> other;
+            if(op->getFirstArg().hasRegister(REG_ELEMENT_NUMBER))
+                other = op->getSecondArg();
+            else if(auto second = op->getSecondArg())
+            {
+                if(second->hasRegister(REG_ELEMENT_NUMBER))
+                    other = op->getFirstArg();
+            }
+            if(!other)
+                return {};
+            auto immediate = other->checkImmediate();
+            if(!immediate)
+                return {};
+            auto literal = immediate->toLiteral();
+            if(!literal)
+                return {};
+            return static_cast<uint8_t>(literal->unsignedInt());
+        }
+        if(auto move = dynamic_cast<const intermediate::MoveOperation*>(&instr))
+        {
+            if(move->getSource().hasRegister(REG_ELEMENT_NUMBER))
+                // a plain move of the element-number register only sets the zero-flag for the 0th element
+                return uint8_t{0};
+        }
+        return {};
+    }
+
+    /*
+     * Verifies that all element insertions created by this fix-up step are consistent: each insertion is preceded by
+     * its own SIMD-element mask and the flags it leaves behind are not used by any following instruction.
+     *
+     * Additionally, all reads and writes of the vectors the values were grouped into are checked to still be part of
+     * the extraction/insertion scheme. Any inconsistency aborts the compilation instead of silently generating code
+     * which computes wrong values.
+     */
+    void verifyElementInsertions(Method& method, const FastSet<const Local*>& groupedVectors,
+        const FastMap<const intermediate::IntermediateInstruction*, uint8_t>& insertions)
+    {
+        if(groupedVectors.empty() && insertions.empty())
+            return;
+
+        const intermediate::IntermediateInstruction* previous = nullptr;
+        for(auto it = method.walkAllInstructions(); !it.isEndOfMethod(); it.nextInMethod())
+        {
+            if(!it.has())
+                continue;
+            const auto& instr = *it.get();
+            if(dynamic_cast<const intermediate::Nop*>(&instr))
+                // NOPs do not touch any flags or local, so they can be ignored for the adjacency check
+                continue;
+
+            const auto insertionIt = insertions.find(&instr);
+            if(insertionIt != insertions.end())
+            {
+                if(!instr.hasDecoration(intermediate::InstructionDecorations::ELEMENT_INSERTION))
+                    throw CompilationError(CompilationStep::CODE_GENERATION,
+                        "Instruction inserting a SIMD element is not marked as such", instr.to_string());
+                const auto selectedElement = previous ? getSelectedSIMDElement(*previous) : Optional<uint8_t>{};
+                if(!selectedElement)
+                    throw CompilationError(CompilationStep::CODE_GENERATION,
+                        "Element insertion is not preceded by its SIMD-element mask",
+                        instr.to_string() + " <- " + (previous ? previous->to_string() : "(nothing)"));
+                if(*selectedElement != insertionIt->second)
+                    throw CompilationError(CompilationStep::CODE_GENERATION,
+                        "Element insertion uses a different SIMD-element than the one the value was grouped into",
+                        instr.to_string() + " expected element " + std::to_string(insertionIt->second) + ", got " +
+                            std::to_string(*selectedElement));
+
+                // the flags set by the mask must only be used by the element insertion itself, otherwise the
+                // instruction(s) behind it would use the SIMD-element mask as their condition
+                for(auto after = it.copy().nextInBlock(); !after.isEndOfBlock(); after.nextInBlock())
+                {
+                    if(!after.has())
+                        continue;
+                    if(after->doesSetFlag())
+                        break;
+                    if(after->hasConditionalExecution())
+                        throw CompilationError(CompilationStep::CODE_GENERATION,
+                            "Element insertion overwrites the flags required by a following instruction",
+                            instr.to_string() + " -> " + after->to_string());
+                }
+            }
+            previous = &instr;
+        }
+
+        if(groupedVectors.empty())
+            return;
+
+        // check all uses of the vectors the values are grouped into
+        for(auto it = method.walkAllInstructions(); !it.isEndOfMethod(); it.nextInMethod())
+        {
+            if(!it.has())
+                continue;
+            const auto& instr = *it.get();
+
+            // every write to a grouped vector must be an element insertion, anything else (e.g. a phi-node) would
+            // overwrite the elements holding the other values
+            if(auto output = instr.checkOutputLocal())
+            {
+                if(groupedVectors.find(output) != groupedVectors.end() &&
+                    !instr.hasDecoration(intermediate::InstructionDecorations::ELEMENT_INSERTION))
+                    throw CompilationError(CompilationStep::CODE_GENERATION,
+                        "Grouped vector is written by something else than an element insertion", instr.to_string());
+            }
+
+            // every read of a grouped vector must be an element insertion (read-modify-write), a plain copy (used for
+            // the extractions) or a vector rotation, and it must not be a phi-node which would interpret all elements
+            bool readsGroupedVector = false;
+            instr.forReadLocals([&](const Local* loc, const intermediate::IntermediateInstruction&) {
+                if(groupedVectors.find(loc) != groupedVectors.end())
+                    readsGroupedVector = true;
+            });
+            if(readsGroupedVector)
+            {
+                bool isExtraction = dynamic_cast<const intermediate::MoveOperation*>(&instr) != nullptr ||
+                    dynamic_cast<const intermediate::VectorRotation*>(&instr) != nullptr;
+                bool isInsertion = instr.hasDecoration(intermediate::InstructionDecorations::ELEMENT_INSERTION);
+                if((!isExtraction && !isInsertion) ||
+                    instr.hasDecoration(intermediate::InstructionDecorations::PHI_NODE))
+                    throw CompilationError(CompilationStep::CODE_GENERATION,
+                        "Grouped vector is used by an instruction which does not extract a single element",
+                        instr.to_string());
+            }
+        }
+    }
+} // namespace
+
 FixupResult qpu_asm::groupParameters(Method& method, const Configuration& config, GraphColoring& coloredGraph)
 {
     analysis::LocalUsageRangeAnalysis localUsageRangeAnalysis(&coloredGraph.getLivenessAnalysis());
@@ -115,6 +313,9 @@ FixupResult qpu_asm::groupParameters(Method& method, const Configuration& config
     bool somethingChanged = false;
 
     FastAccessList<const Parameter*> parametersToBeGrouped;
+    // the instructions inserting the parameters into their group (+ the SIMD element used), for the verification
+    FastMap<const intermediate::IntermediateInstruction*, uint8_t> insertions;
+    FastSet<const Local*> groupedVectors;
     for(const auto& entry : localUsageRangeAnalysis.getOverallUsages())
     {
         if(entry.numLoops > 1)
@@ -196,11 +397,23 @@ FixupResult qpu_asm::groupParameters(Method& method, const Configuration& config
 
         // Parameter writes always read UNIFORMs which are splat values, so we can simply select the desired element
         auto it = mappingIt->second.first;
+        if(flagsAreLive(it))
+        {
+            // The element mask inserted in front of the parameter write sets the flags, which the instructions behind
+            // it would silently use as their condition. Since the write itself cannot be moved (it reads the UNIFORM),
+            // simply do not group this parameter.
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Skipping grouping of parameter '" << (*paramIt)->to_string()
+                    << "', since the flags are still required at its write position" << logging::endl);
+            continue;
+        }
         auto cond = assignNop(it) = selectSIMDElement(groupIndex);
         it.get<intermediate::ExtendedInstruction>()->setCondition(cond);
         it->setOutput(groupedValue);
         it->decoration = remove_flag(it->decoration, intermediate::InstructionDecorations::IDENTICAL_ELEMENTS);
         it->addDecorations(intermediate::InstructionDecorations::ELEMENT_INSERTION);
+        insertions.emplace(it.get(), static_cast<uint8_t>(groupIndex));
+        groupedVectors.emplace(groupedValue->local());
 
         for(auto& readerIt : mappingIt->second.second)
         {
@@ -226,12 +439,21 @@ FixupResult qpu_asm::groupParameters(Method& method, const Configuration& config
         somethingChanged = true;
     }
 
+    if(somethingChanged)
+        // hard verification of the created element insertions
+        verifyElementInsertions(method, groupedVectors, insertions);
+
     return somethingChanged ? FixupResult::FIXES_APPLIED_RECREATE_GRAPH : FixupResult::NOTHING_FIXED;
 }
 
+// A group vector and the locals (in order of their SIMD elements) packed into it
+using LocalGroup = std::array<const Local*, NATIVE_VECTOR_SIZE>;
+
 static std::pair<const Local*, uint8_t> reserveGroupSpace(
-    Method& method, FastMap<const Local*, std::array<const Local*, NATIVE_VECTOR_SIZE>>& groups, const Local* loc)
+    Method& method, FastAccessList<std::pair<const Local*, LocalGroup>>& groups, const Local* loc)
 {
+    // NOTE: The groups are iterated in the order they were created in (and not in the order of some pointer-keyed
+    // container), so that the same input always assigns the same local to the same group position.
     for(auto& group : groups)
     {
         for(std::size_t i = 0; i < group.second.size(); ++i)
@@ -245,18 +467,43 @@ static std::pair<const Local*, uint8_t> reserveGroupSpace(
     }
     // insert new group
     auto group = method.addNewLocal(TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE), "%local_group").local();
-    groups[group].fill(nullptr);
-    groups[group][0] = loc;
+    groups.emplace_back(group, LocalGroup{});
+    groups.back().second.fill(nullptr);
+    groups.back().second[0] = loc;
     return std::make_pair(group, 0);
 }
+
+namespace
+{
+    /*
+     * Information about the code inserted for a single grouped local, used for the final verification.
+     */
+    struct GroupedLocalInsertion
+    {
+        // the instruction inserting the local's value into the group vector
+        const intermediate::IntermediateInstruction* insertion = nullptr;
+        // the basic block the insertion is located in
+        const BasicBlock* block = nullptr;
+        // the SIMD element of the group vector the local is stored in
+        uint8_t elementIndex = 0;
+    };
+} // namespace
 
 FixupResult qpu_asm::groupScalarLocals(
     Method& method, const Configuration& config, const GraphColoring& coloredGraph, bool runConservative)
 {
+    // NOTE: All containers used here are iterated in program order or in the order they were created in, never in the
+    // order of the (ASLR-dependent) memory addresses of their elements. Otherwise the same input would result in
+    // different groupings (and therefore in different, possibly wrong, machine code) between compiler runs.
+    FastAccessList<const Local*> candidateOrder;
     FastMap<const Local*, InstructionWalker> candidateLocals;
-    FastMap<const Local*, FastSet<InstructionWalker>> localReaders;
+    FastMap<const Local*, FastAccessList<InstructionWalker>> localReaders;
+    // membership check for the readers above (an instruction can read the same local multiple times)
+    FastMap<const Local*, FastSet<InstructionWalker>> localReaderSet;
+
     for(auto& block : method)
     {
+        FastAccessList<const Local*> writtenOrder;
         FastMap<const Local*, InstructionWalker> localsWrittenInBlock;
         // the value is a list (as in not-unique) on purpose to keep the count correct for i.e. combined instructions
         FastMap<const Local*, FastAccessList<InstructionWalker>> localsReadInBlock;
@@ -277,22 +524,28 @@ FixupResult qpu_asm::groupScalarLocals(
                             // XXX otherwise we would need to write-back the updated result into the group vector
                             // also don't track phi-writes, since they are always used immediately after the branch
                             // destination label and therefore don't really have a large usage range
-                            localsWrittenInBlock.emplace(loc, it);
+                            if(localsWrittenInBlock.emplace(loc, it).second)
+                                writtenOrder.emplace_back(loc);
                     }
                     if(has_flag(use, LocalUse::Type::READER))
                     {
                         localsReadInBlock[loc].emplace_back(it);
-                        localReaders[loc].emplace(it);
+                        if(localReaderSet[loc].insert(it).second)
+                            localReaders[loc].emplace_back(it);
                     }
                 });
         }
 
-        for(auto& pair : localsWrittenInBlock)
+        for(const auto* local : writtenOrder)
         {
-            auto readIt = localsReadInBlock.find(pair.first);
+            if(!local->hasUsers(LocalUse::Type::READER))
+                // local is not read at all, grouping it would not save any registers
+                continue;
+
+            auto readIt = localsReadInBlock.find(local);
             if(readIt != localsReadInBlock.end())
             {
-                if(readIt->second.size() == pair.first->countUsers(LocalUse::Type::READER))
+                if(readIt->second.size() == local->countUsers(LocalUse::Type::READER))
                     // exclude all locals which have all readers inside the block they are written in - locals which are
                     // only live inside a single block
                     // TODO to simplify, could skip all locals which have any readers inside the block they are
@@ -305,19 +558,27 @@ FixupResult qpu_asm::groupScalarLocals(
                     // if the local is read inside this and other blocks, do some optimization
                     // 1. remove all reads inside this block from the tracked reads, so we do not spill/rematerialize
                     // inside a single block
-                    auto& readers = localReaders[pair.first];
+                    auto& readers = localReaders[local];
                     for(auto& inst : readIt->second)
-                        readers.erase(inst);
+                    {
+                        auto readerIt = std::find_if(readers.begin(), readers.end(),
+                            [&inst](const InstructionWalker& walker) { return walker == inst; });
+                        if(readerIt != readers.end())
+                            readers.erase(readerIt);
+                        localReaderSet[local].erase(inst);
+                    }
                     // 2. move the position to insert the spilling code after the last read
                     auto insertIt = readIt->second.back();
                     if(insertIt.has() && insertIt->doesSetFlag())
                         // ... unless it sets flags, then move before that to not override the flags with out insertion
                         // flags
                         insertIt.previousInBlock();
-                    candidateLocals.emplace(pair.first, insertIt);
+                    if(candidateLocals.emplace(local, insertIt).second)
+                        candidateOrder.emplace_back(local);
                 }
             }
-            candidateLocals.emplace(pair);
+            if(candidateLocals.emplace(local, localsWrittenInBlock.at(local)).second)
+                candidateOrder.emplace_back(local);
         }
     }
 
@@ -346,34 +607,62 @@ FixupResult qpu_asm::groupScalarLocals(
 
     // map of "original" local -> group local (+ index in group) where it is located in
     FastMap<const Local*, std::pair<const Local*, uint8_t>> currentlyGroupedLocals;
-    // map of group local -> contained "original" locals and their positions
-    FastMap<const Local*, std::array<const Local*, NATIVE_VECTOR_SIZE>> groups;
+    // the group vectors with the locals packed into them, in the order the groups were created
+    FastAccessList<std::pair<const Local*, LocalGroup>> groups;
+    // the element insertions created below, for the final verification
+    FastMap<const Local*, GroupedLocalInsertion> insertions;
 
-    for(auto& entry : candidateLocals)
+    for(const auto* local : candidateOrder)
     {
+        const auto candidateIt = candidateLocals.find(local);
+        if(candidateIt == candidateLocals.end())
+            // local was filtered out above
+            continue;
+
+        // The element insertion needs to set the flags for the SIMD-element mask, overwriting all previously calculated
+        // flags. Therefore it may only be inserted at a position where the flags are not read anymore.
+        auto spillPosition = candidateIt->second.nextInBlock();
+        if(flagsAreLive(spillPosition))
+        {
+            // move the insertion behind the instructions still reading the flags
+            const auto deadPosition = findFlagsDeadPosition(spillPosition);
+            if(!deadPosition)
+            {
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Skipping grouping of local '" << local->to_string()
+                        << "', since there is no safe position to insert the element masks" << logging::endl);
+                continue;
+            }
+            spillPosition = *deadPosition;
+        }
+
         // allocate an element in our spill register
-        auto pos = reserveGroupSpace(method, groups, entry.first);
-        currentlyGroupedLocals.emplace(entry.first, pos);
+        auto pos = reserveGroupSpace(method, groups, local);
+        currentlyGroupedLocals.emplace(local, pos);
         CPPLOG_LAZY(logging::Level::DEBUG,
-            log << "Grouping local '" << entry.first->to_string() << "' into " << pos.first->to_string() << " at index "
+            log << "Grouping local '" << local->to_string() << "' into " << pos.first->to_string() << " at index "
                 << static_cast<unsigned>(pos.second) << logging::endl);
 
         // after the local write (or the last read within the writing block), insert the spill code
         // we spill a copy to not force the local to an accumulator (since we do full vector rotation)
         {
-            auto spillIt = entry.second.nextInBlock();
-            auto tmpValue = assign(spillIt, entry.first->type) = entry.first->createReference();
+            auto spillIt = spillPosition;
+            auto tmpValue = assign(spillIt, local->type) = local->createReference();
             spillIt = intermediate::insertVectorInsertion(
                 spillIt, method, pos.first->createReference(), Value(SmallImmediate(pos.second), TYPE_INT8), tmpValue);
+            // the last inserted instruction is the actual element insertion
+            const auto* insertion = spillIt.copy().previousInBlock().get();
             if(!spillIt.isEndOfBlock() && spillIt.get() && spillIt->readsLocal(pos.first))
                 // if we happen to insert a write just before a read of the same container, insert a NOP to prevent the
                 // container to be forced to an accumulator
                 nop(spillIt, intermediate::DelayType::WAIT_REGISTER);
+            insertions.emplace(
+                local, GroupedLocalInsertion{insertion, spillIt.getBasicBlock(), pos.second});
         }
 
         // before all reads (not located in the writing block), insert a dematerialization and use a new temporary
         // local in the read
-        auto& readers = localReaders[entry.first];
+        auto& readers = localReaders[local];
         for(auto reader : readers)
         {
             auto checkIt = reader.copy().previousInBlock();
@@ -382,18 +671,18 @@ FixupResult qpu_asm::groupScalarLocals(
                 // container to be forced to an accumulator
                 nop(reader, intermediate::DelayType::WAIT_REGISTER);
             // need to extract from temporary container to not force the group container to an accumulator
-            auto tmpValue = method.addNewLocal(entry.first->type, entry.first->name);
+            auto tmpValue = method.addNewLocal(local->type, local->name);
             auto tmpContainer = assign(reader, pos.first->type) = pos.first->createReference();
             reader = intermediate::insertVectorExtraction(
                 reader, method, tmpContainer, Value(SmallImmediate(pos.second), TYPE_INT8), tmpValue);
             if(reader->hasUnpackMode() || reader->readsLiteral() || reader->getVectorRotation())
                 // insert a NOP before the  actually reading instruction to allow for e.g. unpack-modes
                 nop(reader, intermediate::DelayType::WAIT_REGISTER);
-            reader->replaceLocal(entry.first, tmpValue);
+            reader->replaceLocal(local, tmpValue);
             if(isUsedAsSplatValue(tmpValue.local()))
             {
                 // we need to recreate the splat property by replicating the value
-                auto splatTmp = method.addNewLocal(entry.first->type, entry.first->name);
+                auto splatTmp = method.addNewLocal(local->type, local->name);
                 reader = intermediate::insertReplication(reader, tmpValue, splatTmp);
                 // XXX could improve by only inserting this NOP if required (e.g. new local can't be on accumulator)
                 nop(reader, intermediate::DelayType::WAIT_REGISTER);
@@ -401,6 +690,51 @@ FixupResult qpu_asm::groupScalarLocals(
             }
         }
     }
+
+    // Hard verification: every use of a grouped local must be either the (single) write inside of its writing block or
+    // one of the extractions inserted above. Since a missed or wrongly indexed use would silently compute a wrong
+    // value, abort the compilation instead of emitting code.
+    FastSet<const Local*> groupedVectors;
+    FastMap<const intermediate::IntermediateInstruction*, uint8_t> insertionInstructions;
+    for(const auto& group : groups)
+        groupedVectors.emplace(group.first);
+    for(const auto& entry : insertions)
+        insertionInstructions.emplace(entry.second.insertion, entry.second.elementIndex);
+    verifyElementInsertions(method, groupedVectors, insertionInstructions);
+    for(const auto& entry : currentlyGroupedLocals)
+    {
+        const auto insertionIt = insertions.find(entry.first);
+        if(insertionIt == insertions.end() || !insertionIt->second.block)
+            continue;
+        // Reads within the block the value is written in may still access the original local, since the original
+        // writer is not modified. All reads outside of that block are not executed on the path writing the value, so
+        // they MUST have been replaced by an extraction of the element the value was grouped into.
+        std::size_t readsInWritingBlock = 0;
+        for(auto it = insertionIt->second.block->walk(); !it.isEndOfBlock(); it.nextInBlock())
+        {
+            if(!it.has())
+                continue;
+            it->forReadLocals([&](const Local* loc, const intermediate::IntermediateInstruction&) {
+                if(loc == entry.first)
+                    ++readsInWritingBlock;
+            });
+        }
+        if(entry.first->countUsers(LocalUse::Type::READER) > readsInWritingBlock)
+            throw CompilationError(CompilationStep::CODE_GENERATION,
+                "Read of grouped local outside of its writing block is not replaced by an extraction of the correct "
+                "element",
+                "local " + entry.first->to_string() + " with " +
+                    std::to_string(entry.first->countUsers(LocalUse::Type::READER)) + " reads, only " +
+                    std::to_string(readsInWritingBlock) + " in its writing block");
+        // the element the local was assigned to must be encoded in the instruction inserting it
+        if(!insertionIt->second.insertion->hasDecoration(
+               intermediate::InstructionDecorations::ELEMENT_INSERTION) ||
+            insertionIt->second.insertion->checkOutputLocal() != entry.second.first)
+            throw CompilationError(CompilationStep::CODE_GENERATION,
+                "Invalid element insertion for grouped local",
+                "local " + entry.first->to_string() + " -> " + insertionIt->second.insertion->to_string());
+    }
+
     return FixupResult::FIXES_APPLIED_RECREATE_GRAPH;
 }
 
