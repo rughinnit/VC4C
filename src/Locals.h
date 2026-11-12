@@ -13,6 +13,7 @@
 #include "performance.h"
 #include "tools/SmallMap.h"
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -268,6 +269,16 @@ namespace vc4c
          * The name of this object
          */
         std::string name;
+        /*
+         * A unique, monotonically increasing identifier of this local.
+         *
+         * In contrast to the name (which is neither unique nor necessarily stable between compiler runs) and to the
+         * memory address (which is not deterministic due to ASLR), this identifier provides a stable total order of all
+         * locals created within a single compiler run. It is used by the register allocator and the register fix-up
+         * steps to iterate over locals in a deterministic order, so that the same input always results in the same
+         * machine code.
+         */
+        const std::size_t id;
 
     protected:
         Local(DataType type, const std::string& name);
@@ -282,6 +293,36 @@ namespace vc4c
         std::unique_ptr<LocalData> data;
 
         friend class Method;
+    };
+
+    /*
+     * Comparator for ordering locals by their deterministic identifier instead of their memory address.
+     *
+     * Containers ordered this way iterate in the same order for the same input, independent of the memory layout of
+     * the current process. This is required for all containers whose iteration order influences the generated code.
+     */
+    struct LocalIdLess
+    {
+        bool operator()(const Local* left, const Local* right) const noexcept
+        {
+            return left->id < right->id;
+        }
+    };
+
+    /*
+     * Comparator for ordering locals by their deterministic identifier, with the local created last coming first.
+     *
+     * Since the register allocator assigns the register files in the order it takes the locals from its work-lists, the
+     * iteration order of these work-lists decides the generated code. Coloring the most recently created locals first
+     * was measured to give allocations at least as good as the previous (memory-layout dependent, effectively random)
+     * order for all kernels of the test corpus, while being reproducible.
+     */
+    struct LocalIdGreater
+    {
+        bool operator()(const Local* left, const Local* right) const noexcept
+        {
+            return left->id > right->id;
+        }
     };
 
     /*
