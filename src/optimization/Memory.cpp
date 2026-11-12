@@ -755,6 +755,23 @@ std::size_t optimizations::groupVPMAccess(const Module& module, Method& method, 
     return numChanges;
 }
 
+/*
+ * The maximum number of single-element (scalar) memory reads that are combined into one TMU read.
+ *
+ * Every element beyond the first one is extracted from the combined vector with a vector rotation, and the rotated
+ * value stays live until it has been multiplied into the accumulator for that element. Since only five registers of the
+ * QPU are accessible as accumulators (r0-r3 and r5), the register allocator has to map the remaining rotated values to
+ * the general-purpose register files. For those, a read in the instruction following the write still returns the
+ * previous value, so a delay instruction is required. The delay insertion is based on heuristics about which locals
+ * will be mapped to accumulators (see #splitReadAfterWrites()) and does not cover every mapping the register allocation
+ * can produce, which makes kernels with too many simultaneously live accumulator values compute wrong results. Observed
+ * with a register-tiled GEMM using 8 row accumulators at N = 96, which returned garbage in the last accumulator row.
+ *
+ * Groups of vector reads (e.g. the four rows loaded with vload4()) are not affected: their elements are extracted
+ * within a quad, so only up to four values are live at the same time. Those groups therefore remain unrestricted.
+ */
+static constexpr std::size_t MAX_GROUPED_SCALAR_TMU_READS = 6;
+
 struct TMUAccessGroup
 {
     std::shared_ptr<periphery::TMUCacheEntry> cacheEntry;
@@ -1094,6 +1111,18 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
     }
     if(group.ramReads.size() <= 1)
         return false;
+    if(group.usedVectorSize == group.ramReads.size() && group.ramReads.size() > MAX_GROUPED_SCALAR_TMU_READS)
+    {
+        // Only single-element reads are grouped here, so every element beyond the first one needs its own accumulator
+        // for the rotated value. Beyond the limit documented at #MAX_GROUPED_SCALAR_TMU_READS, the register allocation
+        // can produce code with a missing read-after-write delay, which computes garbage. Since combining the reads is
+        // only a performance optimization, skip it in that case instead of generating possibly wrong code.
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Not combining " << group.ramReads.size() << " scalar reads of memory into one TMU load, since "
+                << group.ramReads.size() << " simultaneously live values would exceed the safe limit of "
+                << MAX_GROUPED_SCALAR_TMU_READS << logging::endl);
+        return false;
+    }
     CPPLOG_LAZY(logging::Level::DEBUG,
         log << "Combining " << group.ramReads.size() << " reads of memory into one TMU load... " << logging::endl);
 
