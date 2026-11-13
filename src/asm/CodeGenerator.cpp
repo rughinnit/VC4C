@@ -11,6 +11,7 @@
 #include "../Profiler.h"
 #include "../optimization/Optimizer.h"
 #include "../optimization/Peephole.h"
+#include "../optimization/RegisterDelays.h"
 #include "GraphColoring.h"
 #include "KernelInfo.h"
 #include "RegisterFixes.h"
@@ -151,6 +152,13 @@ const FastAccessList<DecoratedInstruction>& CodeGenerator::generateInstructions(
     if(optimizations::Optimizer::isEnabled(optimizations::PASS_PEEPHOLE_COMBINE, config))
         optimizations::combineRegisterMappedOperations(module, method, config, registerMapping);
 
+    // Re-check the register delays with the actual register mapping. The delays inserted before the register-allocation
+    // are based on the heuristic whether a local will be mapped to an accumulator (see #splitReadAfterWrites()), which
+    // the register-allocation and the re-ordering can invalidate. In addition, filling a delay NOP with another
+    // instruction can create new write-read pairs. This is a correctness fix, so it runs independent of the enabled
+    // optimizations.
+    optimizations::insertMissingRegisterDelays(module, method, config, registerMapping);
+
     // create label-map + remove labels
     const auto labelMap = mapLabels(method);
 
@@ -200,6 +208,10 @@ const FastAccessList<DecoratedInstruction>& CodeGenerator::generateInstructions(
             ++it;
         }
     }
+
+    // Last check before the machine-code is written out: a violation of the register delay model is a miscompile,
+    // since the QPU silently reads the previous value, so abort instead of emitting wrong code.
+    optimizations::verifyRegisterDelays(module, method, generatedInstructions);
 
     CPPLOG_LAZY(logging::Level::DEBUG, log << "-----" << logging::endl);
     index = 0;
