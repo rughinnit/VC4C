@@ -761,11 +761,18 @@ std::size_t optimizations::groupVPMAccess(const Module& module, Method& method, 
  * Every element beyond the first one is extracted from the combined vector with a vector rotation, and the rotated
  * value stays live until it has been multiplied into the accumulator for that element. Since only five registers of the
  * QPU are accessible as accumulators (r0-r3 and r5), the register allocator has to map the remaining rotated values to
- * the general-purpose register files. For those, a read in the instruction following the write still returns the
- * previous value, so a delay instruction is required. The delay insertion is based on heuristics about which locals
- * will be mapped to accumulators (see #splitReadAfterWrites()) and does not cover every mapping the register allocation
- * can produce, which makes kernels with too many simultaneously live accumulator values compute wrong results. Observed
- * with a register-tiled GEMM using 8 row accumulators at N = 96, which returned garbage in the last accumulator row.
+ * the general-purpose register files.
+ *
+ * Part of the resulting hazard is fixed: the read-after-write delays are re-checked after the register-mapping against
+ * the actual register files and the rotation rules (see optimizations#insertMissingRegisterDelays()), and a violation
+ * which cannot be fixed is a compilation error (see optimizations#verifyRegisterDelays()). A register-tiled GEMM with
+ * seven or eight row accumulators is correct with that check in place.
+ *
+ * The check is NOT sufficient for this optimization, though: with eight combined reads the GEMM is still wrong for
+ * some rows, and inserting a delay instruction in front of every instruction of the kernel does not change that, so
+ * the remaining defect is not a missing delay (it is most likely in the per-lane address handling of the combined
+ * read itself, see the M18 report). Until that is understood, the number of simultaneously live values is limited to
+ * the value below, since not combining the reads is always correct: it only loses performance.
  *
  * Groups of vector reads (e.g. the four rows loaded with vload4()) are not affected: their elements are extracted
  * within a quad, so only up to four values are live at the same time. Those groups therefore remain unrestricted.
