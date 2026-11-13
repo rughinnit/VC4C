@@ -15,6 +15,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <sstream>
 
 using namespace vc4c;
 using namespace vc4c::qpu_asm;
@@ -844,11 +845,47 @@ static NODISCARD bool reassignNodeToRegister(ColoredGraph& graph, ColoredNode& n
     return fixed;
 }
 
+/*
+ * Whether the register-conflict repair for this local would have to materialise a copy of a value which is not a
+ * single scalar:
+ * - a multi-element vector is copied by inserting its elements into the temporary, i.e. by vector rotations in every
+ *   instruction that uses the local,
+ * - a pointer is a uniform value, copying it into a per-lane temporary drops the uniformity the register-allocator
+ *   tracks for it.
+ * Neither copy is a plain register move, and nothing verifies that the rewritten program still computes the same
+ * values - every kernel measured which needed this repair produced wrong results. The repair is therefore refused
+ * instead of emitting wrong machine-code.
+ */
+static bool needsValueCopy(const Local* loc)
+{
+    return loc->type.getVectorWidth() != 1 || loc->type.getPointerType() != nullptr;
+}
+
+static void refuseValueCopyRepair(const Method& method, const ColoredNode& node)
+{
+    std::ostringstream description;
+    description << "local '" << node.key->name << "', type " << node.key->type.to_string() << ", in function '"
+                << method.name << "': live at the same time as " << node.getEdgesSize() << " other locals, still free: "
+                << node.countFreeRegisters(RegisterFile::ACCUMULATOR) << " accumulator(s), "
+                << node.countFreeRegisters(RegisterFile::PHYSICAL_A) << " register(s) in file A, "
+                << node.countFreeRegisters(RegisterFile::PHYSICAL_B) << " register(s) in file B";
+    throw CompilationError(CompilationStep::LABEL_REGISTER_MAPPING,
+        "Cannot resolve this register-conflict: repairing it would copy a vector or pointer local into a temporary "
+        "register, which is not implemented. Reduce the number of simultaneously live values (smaller tile or "
+        "k-block, fewer rows per work-item) or split the kernel into smaller kernels",
+        description.str());
+}
+
 static NODISCARD bool moveLocalToRegisterFile(Method& method, ColoredGraph& graph, ColoredNode& node,
     FastMap<const Local*, LocalUsage>& localUses, LocalUsage& localUse, const RegisterFile file)
 {
     bool needNextRound = false;
     const auto& users = node.key->getUsers();
+
+    // See needsValueCopy(): copying such a value into a temporary is not a plain register move, and the rewritten
+    // program is not verified to compute the same values, so refuse it instead of emitting wrong code.
+    if(needsValueCopy(node.key))
+        refuseValueCopyRepair(method, node);
 
     // this might strain the accumulators, which can be fixed by the next iteration in CASE 1)
 
@@ -1183,7 +1220,11 @@ static NODISCARD bool fixSingleError(Method& method, ColoredGraph& graph, Colore
         }
         else if(!moveToFileA && !moveToFileB)
         {
-            // there are no more free register AT ALL, so we cannot do anything useful here
+            // there are no more free register AT ALL, so we cannot do anything useful here. Giving up silently is
+            // not acceptable for a local which cannot be copied cheaply: the later fix-up steps would rewrite the
+            // program until it becomes colorable again and emit code which computes wrong values.
+            if(needsValueCopy(node.key))
+                refuseValueCopyRepair(method, node);
             return false;
         }
 
@@ -1243,13 +1284,45 @@ bool GraphColoring::fixErrors()
     return errorSet.empty();
 }
 
+std::string GraphColoring::describeUnassignedLocal(const Local* loc) const
+{
+    const auto& node = graph.assertNode(loc);
+    std::ostringstream description;
+    description << "local '" << loc->name << "', type " << loc->type.to_string() << ", in function '" << method.name
+                << "': live at the same time as " << node.getEdgesSize() << " other locals, still free: "
+                << node.countFreeRegisters(RegisterFile::ACCUMULATOR) << " accumulator(s), "
+                << node.countFreeRegisters(RegisterFile::PHYSICAL_A) << " register(s) in file A, "
+                << node.countFreeRegisters(RegisterFile::PHYSICAL_B) << " register(s) in file B, possible "
+                << "register-files: " << toString(node.possibleFiles);
+    return description.str();
+}
+
+std::string GraphColoring::getUnassignedLocalsDescription() const
+{
+    std::ostringstream description;
+    bool first = true;
+    for(const Local* loc : errorSet)
+    {
+        if(!first)
+            description << "; ";
+        first = false;
+        description << describeUnassignedLocal(loc);
+    }
+    return description.str();
+}
+
 FastMap<const Local*, Register> GraphColoring::toRegisterMap() const
 {
     if(!errorSet.empty())
     {
         for(const Local* loc : errorSet)
             logging::error() << "Error assigning local to register: " << loc->name << logging::endl;
-        throw CompilationError(CompilationStep::LABEL_REGISTER_MAPPING, "There are erroneous register-associations!");
+        // Refuse to emit machine-code for a program the register-allocator could not color: the map would be
+        // incomplete and the resulting kernel would silently compute wrong values.
+        throw CompilationError(CompilationStep::LABEL_REGISTER_MAPPING,
+            "There are erroneous register-associations, reduce the number of simultaneously live values (smaller "
+            "tile or k-block, fewer rows per work-item) or split the kernel into smaller kernels. Details",
+            getUnassignedLocalsDescription());
     }
 
     FastMap<const Local*, Register> result;
