@@ -12,6 +12,7 @@
 #include "../optimization/Optimizer.h"
 #include "../optimization/Peephole.h"
 #include "../optimization/RegisterDelays.h"
+#include "../analysis/InterferenceGraph.h"
 #include "GraphColoring.h"
 #include "KernelInfo.h"
 #include "RegisterFixes.h"
@@ -80,6 +81,44 @@ static FastMap<const Local*, std::size_t> mapLabels(Method& method)
     return labelsMap;
 }
 
+/*
+ * Verifies that the final register mapping does not assign the same register to two locals which are live at the same
+ * time. The colored graph's own error-set is not sufficient for this: the register fix-up steps insert new locals and
+ * rewrite instructions, so the graph the mapping was created from can be stale. A mapping which violates interference
+ * makes the machine-code read another local's value, i.e. silently wrong results, so this must abort the compilation
+ * instead of emitting the kernel.
+ */
+static void verifyRegisterMapping(Method& method, const FastMap<const Local*, Register>& registerMapping)
+{
+    const auto interferenceGraph = analysis::InterferenceGraph::createGraph(method);
+    std::size_t numConflicts = 0;
+    for(const auto& node : interferenceGraph->getNodes())
+    {
+        auto mappingIt = registerMapping.find(node.first);
+        if(mappingIt == registerMapping.end() || mappingIt->second == REG_NOP)
+            continue;
+        node.second.forAllEdges(
+            [&](const analysis::InterferenceNode& neighbor, const analysis::Interference& edge) -> bool {
+                auto neighborIt = registerMapping.find(neighbor.key);
+                if(neighborIt == registerMapping.end() || neighborIt->second == REG_NOP)
+                    return true;
+                if(neighborIt->second != mappingIt->second)
+                    return true;
+                ++numConflicts;
+                logging::error() << "Register conflict: '" << node.first->name << "' and '" << neighbor.key->name
+                                 << "' are both assigned to " << mappingIt->second.to_string(true, false) << " ("
+                                 << (edge.data == analysis::InterferenceType::USED_TOGETHER ? "used together" :
+                                                                                            "live at the same time")
+                                 << ")" << logging::endl;
+                return true;
+            });
+    }
+    if(numConflicts > 0)
+        throw CompilationError(CompilationStep::LABEL_REGISTER_MAPPING,
+            "Register allocation produced conflicting register assignments, refusing to emit incorrect machine-code",
+            std::to_string(numConflicts) + " conflicting register assignment(s)");
+}
+
 static FixupResult runRegisterFixupStep(const RegisterFixupStep& step, Method& method, const Configuration& config,
     std::unique_ptr<GraphColoring>& coloredGraph)
 {
@@ -145,6 +184,8 @@ const FastAccessList<DecoratedInstruction>& CodeGenerator::generateInstructions(
     PROFILE_START(toRegisterMap);
     auto registerMapping = coloredGraph->toRegisterMap();
     PROFILE_END(toRegisterMap);
+
+    verifyRegisterMapping(method, registerMapping);
 
     // run some peephole-optimizations
     if(optimizations::Optimizer::isEnabled(optimizations::PASS_PEEPHOLE_REMOVE, config))

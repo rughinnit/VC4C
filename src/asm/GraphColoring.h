@@ -147,6 +147,21 @@ namespace vc4c
             FastMap<const Local*, Register> toRegisterMap() const;
 
             /*!
+             * Returns a human-readable description of all locals which could not be assigned to a register, including
+             * the function they are used in, the number of locals they are live at the same time with and the
+             * registers still free for them.
+             *
+             * \return the description, empty if a register was found for every local
+             */
+            std::string getUnassignedLocalsDescription() const;
+
+            /*!
+             * Returns a human-readable description of a single local which could not be assigned to a register,
+             * including the function it is used in, its type and the registers still free for it.
+             */
+            std::string describeUnassignedLocal(const Local* local) const;
+
+            /*!
              * \return the liveness analysis created and updated by #colorGraph() to be reused for more advanced
              * rewrites/register association fixes.
              */
