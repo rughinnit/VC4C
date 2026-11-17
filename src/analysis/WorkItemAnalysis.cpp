@@ -16,6 +16,7 @@
 #include "FlagsAnalysis.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <bitset>
 #include <queue>
 
@@ -941,7 +942,14 @@ namespace
             }
 
             const auto elementBytes = getAccessedElementBytes(*mem);
-            if(!addressStep.known || elementBytes <= 0 || addressStep.step != elementBytes)
+            // experimental: a per-lane block of C contiguous elements (store step = C * element size) is accepted
+            // when VC4C_LANE_BLOCK_STORES is set, so it can be lowered as a vertical VDW (lane-major output).
+            static const bool allowLaneBlockStores = std::getenv("VC4C_LANE_BLOCK_STORES") != nullptr;
+            const bool isLaneBlockStore = isWrite && allowLaneBlockStores && elementBytes > 0 &&
+                (!addressStep.known ||
+                    (addressStep.step > elementBytes && addressStep.step % elementBytes == 0));
+            if((!addressStep.known && !isLaneBlockStore) || elementBytes <= 0 ||
+                (addressStep.known && addressStep.step != elementBytes && !isLaneBlockStore))
             {
                 if(!isWrite && isReadViaTMU(mem->getSource()))
                     // the read address is lowered to a per-SIMD-lane TMU address vector, which performs a gather
