@@ -231,6 +231,82 @@ static const intermediate::Operation* getSimpleLocalMove(const intermediate::Ope
     return nullptr;
 }
 
+/*
+ * Whether the value in #reg can be read as the source of the given vector rotation.
+ *
+ * "The full horizontal vector rotate is only available when both of the mul ALU input arguments are taken from
+ * accumulators r0-r3." (Broadcom, page 20), a per-quad rotation reads register-file A (see
+ * VectorRotation#convertToAsm()) and register r5 can only be used as the (dynamic) rotation offset, not as the value
+ * to rotate.
+ */
+static bool isRotationInputRegister(const intermediate::RotationInfo& rotation, const Register& reg)
+{
+    const bool isRotatableAccumulator = reg.file == RegisterFile::ACCUMULATOR && reg.num >= 32 && reg.num <= 35;
+    if(rotation.type == intermediate::RotationType::FULL)
+        return isRotatableAccumulator;
+    if(rotation.type == intermediate::RotationType::PER_QUAD)
+        return reg.file == RegisterFile::PHYSICAL_A;
+    // RotationType::ANY: either a full (accumulator input) or a per-quad (register-file A input) rotation
+    return isRotatableAccumulator || reg.file == RegisterFile::PHYSICAL_A;
+}
+
+/*
+ * Whether the instruction at #it writes to the register #reg (directly or via a local mapped to it).
+ */
+static bool writesRegisterOf(const InstructionWalker it, const RegisterMap& registerMap, const Register& reg)
+{
+    if(it.isEndOfMethod() || !it.has())
+        return false;
+    bool writes = false;
+    it.forAllInstructions([&](const intermediate::IntermediateInstruction& inst) {
+        if(auto out = inst.checkOutputRegister())
+            writes = writes || *out == reg;
+        else if(auto outLocal = inst.checkOutputLocal())
+        {
+            auto locIt = registerMap.find(outLocal);
+            writes = writes || (locIt != registerMap.end() && locIt->second == reg);
+        }
+    });
+    return writes;
+}
+
+/*
+ * Whether the value of a local mapped to #reg may be used instead of the local read by #readerIt when the local is
+ * currently created by a move in front of it, i.e. whether removing that move (and with it the delay it provides) is
+ * allowed. Besides the delay rules checked by #canRemoveInstructionBetween(), a vector rotation has additional
+ * restrictions on the register its input is located in and must not directly follow an instruction writing that
+ * register ("An instruction that does a vector rotate must not immediately follow an instruction that writes to the
+ * accumulator that is being rotated", page 37).
+ */
+static bool isUsableMoveInput(
+    const InstructionWalker beforeReaderIt, const InstructionWalker readerIt, const Register& reg,
+    const RegisterMap& registerMap)
+{
+    if(readerIt.isEndOfBlock() || readerIt.isEndOfMethod())
+        return true;
+    auto rotation = readerIt->getVectorRotation();
+    if(!rotation)
+        return true;
+    if(!isRotationInputRegister(*rotation, reg))
+        return false;
+    /*
+     * The rotation must not read and write the same register after the rewrite, since that would modify the value
+     * instead: the rotation is executed in place on the register of the move output, and the value read instead (e.g.
+     * a vector which is rotated by several different offsets) can still be used by the instructions following it.
+     */
+    auto output = readerIt->checkOutputRegister();
+    if(auto outputLocal = readerIt->checkOutputLocal())
+    {
+        auto outputIt = registerMap.find(outputLocal);
+        if(outputIt == registerMap.end())
+            return false;
+        output = outputIt->second;
+    }
+    if(!output || *output == reg)
+        return false;
+    return !writesRegisterOf(beforeReaderIt, registerMap, reg);
+}
+
 void optimizations::removeObsoleteInstructions(
     const Module& module, Method& kernel, const Configuration& config, const RegisterMap& registerMap)
 {
@@ -318,7 +394,9 @@ void optimizations::removeObsoleteInstructions(
                  * replication register are only removed if the input is already a splat value.
                  */
                 if(!nextIt.isEndOfMethod() && it.getBasicBlock() == nextIt.getBasicBlock() &&
-                    nextIt->readsLocal(moveOut) && canRemoveInstructionBetween(lastInstruction, nextIt, registerMap))
+                    nextIt->readsLocal(moveOut) &&
+                    isUsableMoveInput(lastInstruction, nextIt, inIt->second, registerMap) &&
+                    canRemoveInstructionBetween(lastInstruction, nextIt, registerMap))
                 {
                     /*
                      * Next instruction is the single reader of the move output and there is no need for a delay
@@ -340,10 +418,21 @@ void optimizations::removeObsoleteInstructions(
                     findSingleReaderInBlock(it, it.getBasicBlock()->walkEnd(), moveOut, registerMap, inIt->second);
                 auto beforeReaderIt =
                     !readerIt.isStartOfBlock() ? readerIt.copy().previousInBlock() : Optional<InstructionWalker>{};
+                /*
+                 * The single reader may also be a vector rotation. Removing the move then also moves the rotation one
+                 * instruction up, so only the distance between the instruction in front of the move and the rotation
+                 * has to satisfy the delay rules (see #isUsableMoveInput()) - the instructions in between are not
+                 * removed. The register the input is mapped to has to be usable as the rotation input, see
+                 * #isRotationInputRegister().
+                 */
+                const bool readerIsRotation =
+                    !readerIt.isEndOfBlock() && readerIt->getVectorRotation();
                 if(!readerIt.isEndOfBlock() && readerIt->readsLocal(moveOut) && !readerIt->hasUnpackMode() &&
-                    !readerIt->getVectorRotation() && !nextIt.isEndOfMethod() &&
-                    canRemoveInstructionBetween(lastInstruction, readerIt, registerMap) && beforeReaderIt &&
-                    canRemoveInstructionBetween(*beforeReaderIt, readerIt, registerMap) &&
+                    !nextIt.isEndOfMethod() &&
+                    canRemoveInstructionBetween(
+                        lastInstruction, readerIsRotation ? nextIt : readerIt, registerMap) &&
+                    beforeReaderIt && canRemoveInstructionBetween(*beforeReaderIt, readerIt, registerMap) &&
+                    isUsableMoveInput(*beforeReaderIt, readerIt, inIt->second, registerMap) &&
                     !(*beforeReaderIt)->writesLocal(moveIn))
                 {
                     CPPLOG_LAZY(logging::Level::DEBUG,

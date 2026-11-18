@@ -38,6 +38,11 @@ namespace vc4c
             // whether this local is read in a vector rotation and is therefore additionally limited at the possible
             // mapped registers
             bool isFullVectorRotated = false;
+            // whether an accumulator is the better (but not the only possible) register for this local, e.g. for a
+            // short-lived multiply product which is added up in the next instructions (see
+            // #prefersAccumulator() in GraphColoring.cpp). This is a preference only: the local may still be mapped
+            // to the physical register files and the coloring falls back to them if no accumulator is free.
+            bool prefersAccumulator = false;
 
             LocalUsage(InstructionWalker first, InstructionWalker last);
         };
@@ -84,6 +89,9 @@ namespace vc4c
 
             RegisterFile initialFile;
             RegisterFile possibleFiles;
+            // whether this local should preferably be mapped to an accumulator if one is free, see
+            // LocalUsage#prefersAccumulator
+            bool preferAccumulator = false;
 
         private:
             std::bitset<32> availableA = 0xFFFFFFFFUL;
@@ -186,6 +194,15 @@ namespace vc4c
 
             void createGraph();
             void resetGraph();
+            /*
+             * Runs a single complete coloring of the (freshly created) graph.
+             *
+             * If #preferAccumulators is set, locals for which an accumulator is the better register (see
+             * #prefersAccumulator()) are assigned to an accumulator if one is free.
+             *
+             * \return whether all locals were assigned to a register
+             */
+            NODISCARD bool colorGraph(bool preferAccumulators);
         };
     } // namespace qpu_asm
 } // namespace vc4c

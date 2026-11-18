@@ -415,6 +415,130 @@ static void fixLocals(const InstructionWalker it, FastMap<const Local*, LocalUsa
     }
 }
 
+/*
+ * ==================================================================================================================
+ * Register-file preference for accumulator values
+ * ==================================================================================================================
+ *
+ * The QPU has no forwarding path from the general-purpose register files into the ALUs, but the accumulators can be
+ * read by the instruction directly following the one writing them (see the delay model in RegisterDelays.cpp). A value
+ * produced on the MUL ALU and consumed by an instruction on the ADD ALU can therefore be made available one
+ * instruction earlier by mapping it to an accumulator, which frees the delay slot that the distance of 2 required. In a
+ * loop body which uses that slot for another instruction (in gemm_v16 it holds the copy that materializes a value for a
+ * vector rotation), that instruction can then be removed, saving one word per iteration.
+ *
+ * NOTE: The multiply and the operation reading its result cannot be combined into a single instruction word: both read
+ * a value from register-file A and the word has only one raddr_a field (see the M22 measurements). The saving always
+ * comes from the delay slot, never from packing the multiply with its consumer.
+ *
+ * The price is one accumulator blocked for the short live range of the value instead of one register of file A or B.
+ * This trade-off is not taken into account by the register allocator on its own: for a local which is read more than
+ * one instruction after it was written, intermediate::needsDelay() (see intermediate/Helper.cpp) correctly concludes
+ * that no delay instruction is necessary, so nothing forces the local to an accumulator, even though an accumulator is
+ * strictly better.
+ *
+ * The preference is deliberately soft (see ColoredNodeBase#preferAccumulator): the coloring tries it first and is
+ * repeated without it if it does not succeed (see GraphColoring#colorGraph()), so a program is never rejected
+ * because of it.
+ */
+static constexpr std::size_t MAX_PRODUCT_READER_DISTANCE = 4;
+
+/*
+ * Whether the local is a short-lived product of an operation which can only run on the MUL ALU, which is read exactly
+ * once by an operation on the ADD ALU. For such a local an accumulator is the better register file (see above).
+ */
+static bool prefersAccumulator(const Local* local, const LocalUsage& usage)
+{
+    if(!has_flag(usage.possibleFiles, RegisterFile::ACCUMULATOR))
+        // the uses of this local already forbid accumulators (e.g. an unpacking reader)
+        return false;
+    if(local->countUsers(LocalUse::Type::READER) != 1)
+        // the value is read more than once, so it is not a short-lived intermediate result
+        return false;
+
+    const LocalUser* writer = local->getSingleWriter();
+    const auto* writeOp = dynamic_cast<const intermediate::Operation*>(writer);
+    if(writeOp == nullptr || !writeOp->isSimpleOperation() || !writeOp->op.runsOnMulALU() ||
+        writeOp->op.runsOnAddALU())
+        // the value is not the result of an operation which can only be executed on the MUL ALU (e.g. a float
+        // multiply)
+        return false;
+
+    const LocalUser* reader = nullptr;
+    local->forUsers(LocalUse::Type::READER, [&reader](const LocalUser* user) { reader = user; });
+    const auto* readOp = dynamic_cast<const intermediate::Operation*>(reader);
+    if(readOp == nullptr || !readOp->op.runsOnAddALU() || readOp->getVectorRotation() || readOp->hasUnpackMode())
+        // the value is not read as a plain operand by an operation the ADD ALU can execute
+        return false;
+
+    // the accumulator is only blocked for the live range of the local, which must therefore be short: the reader has to
+    // be one of the next few instructions of the same basic block
+    InstructionWalker writerIt;
+    InstructionWalker readerIt;
+    bool hasWriterIt = false;
+    bool hasReaderIt = false;
+    for(const auto& it : usage.associatedInstructions)
+    {
+        if(it.get() == writer)
+        {
+            writerIt = it;
+            hasWriterIt = true;
+        }
+        else if(it.get() == reader)
+        {
+            readerIt = it;
+            hasReaderIt = true;
+        }
+    }
+    if(!hasWriterIt || !hasReaderIt || writerIt.getBasicBlock() != readerIt.getBasicBlock())
+        return false;
+
+    std::size_t numInstructionsBetween = 0;
+    while(true)
+    {
+        writerIt.nextInBlock();
+        if(writerIt.isEndOfBlock())
+            // the reader is not reached in this block
+            return false;
+        if(writerIt.get() == readerIt.get())
+            break;
+        if(writerIt.has() && writerIt->mapsToASMInstruction())
+            ++numInstructionsBetween;
+        if(numInstructionsBetween >= MAX_PRODUCT_READER_DISTANCE)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * If #local is a value which is materialized only to be rotated by a full vector rotation and is produced by a simple
+ * move from another local, returns that source local.
+ *
+ * A full vector rotation can only read accumulators r0-r3 (Broadcom, page 20), so the front-end has to copy the value
+ * to rotate into an accumulator first (see the "Moving source of vector-rotation to temporary" rewrite in
+ * normalization/Rewrite.cpp). If the value to rotate already lives in an accumulator, that copy becomes redundant and
+ * is removed by optimizations::removeObsoleteInstructions(), which saves one instruction per rotation.
+ */
+static const Local* getCopiedLocalOfRotatedValue(
+    const Local* local, const FastMap<const Local*, LocalUsage>& localUses)
+{
+    if(!localUses.at(local).isFullVectorRotated)
+        // the local is not required to be in an accumulator for a vector rotation
+        return nullptr;
+    const LocalUser* writer = local->getSingleWriter();
+    const auto* move = dynamic_cast<const intermediate::MoveOperation*>(writer);
+    if(move == nullptr || !move->isSimpleMove() || move->getVectorRotation() || move->hasConditionalExecution())
+        return nullptr;
+    const Local* source = move->getMoveSource() ? move->getMoveSource()->checkLocal() : nullptr;
+    if(source == nullptr || source == local)
+        return nullptr;
+    auto sourceIt = localUses.find(source);
+    if(sourceIt == localUses.end() || !has_flag(sourceIt->second.possibleFiles, RegisterFile::ACCUMULATOR))
+        // the source cannot be mapped to an accumulator anyway
+        return nullptr;
+    return source;
+}
+
 GraphColoring::GraphColoring(Method& method, InstructionWalker it) :
     method(method), closedSet(), openSet(), livenessAnalysis(true), localUses()
 {
@@ -462,6 +586,40 @@ GraphColoring::GraphColoring(Method& method, InstructionWalker it) :
         }
         it.nextInMethod();
     }
+
+    /*
+     * Mark the locals for which an accumulator is the better register file, but which are not forced there by the
+     * read-after-write rules above (see #prefersAccumulator() for the details). This is a preference only, it never
+     * removes a possible register file.
+     */
+    PROFILE_SCOPE(PreferAccumulatorForProducts);
+    for(auto& pair : localUses)
+    {
+        if(prefersAccumulator(pair.first, pair.second))
+        {
+            pair.second.prefersAccumulator = true;
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Local " << pair.first->name
+                    << " is a short-lived multiply product, an accumulator is the better register file" << logging::endl);
+        }
+    }
+    /*
+     * Same for a local which is only copied into a value which is materialized for a vector rotation: if the source is
+     * in an accumulator itself, the copy is redundant and can be removed completely (see
+     * optimizations::removeObsoleteInstructions()), so the accumulator is the better register file for the source as
+     * well.
+     */
+    PROFILE_SCOPE(PreferAccumulatorForRotatedValues);
+    for(auto& pair : localUses)
+    {
+        const Local* source = getCopiedLocalOfRotatedValue(pair.first, localUses);
+        if(source == nullptr)
+            continue;
+        localUses.at(source).prefersAccumulator = true;
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Local " << source->name << " is only copied into the rotated value " << pair.first->name
+                << ", an accumulator is the better register file" << logging::endl);
+    }
 }
 
 /**
@@ -502,6 +660,7 @@ void GraphColoring::createGraph()
         auto& node = graph.getOrCreateNode(pair.first);
         node.possibleFiles = pair.second.possibleFiles;
         node.initialFile = pair.second.possibleFiles;
+        node.preferAccumulator = pair.second.prefersAccumulator;
         {
             auto writer = pair.first->getSingleWriter();
             auto load = dynamic_cast<const intermediate::LoadImmediate*>(writer);
@@ -729,6 +888,32 @@ static void processClosedSet(ColoredGraph& graph, SortedSet<const Local*, LocalI
 
 bool GraphColoring::colorGraph()
 {
+    /*
+     * Mapping a local to the physical register files instead of an accumulator is never a correctness problem, it only
+     * costs a delay instruction. The preference for accumulators (see #prefersAccumulator()) is therefore only ever
+     * attempted first: if the graph cannot be colored with it, the allocation is repeated without it. This way the
+     * optimization can never make a kernel fail to compile.
+     */
+    try
+    {
+        if(colorGraph(true))
+            return true;
+    }
+    catch(const CompilationError& err)
+    {
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Register-allocation preferring accumulators for the multiply products failed (" << err.what() << ')'
+                << logging::endl);
+    }
+    CPPLOG_LAZY(logging::Level::DEBUG,
+        log << "Register-allocation is repeated without preferring accumulators for the multiply products"
+            << logging::endl);
+    resetGraph();
+    return colorGraph(false);
+}
+
+bool GraphColoring::colorGraph(const bool preferAccumulators)
+{
     if(!graph.getNodes().empty())
     {
         PROFILE(resetGraph);
@@ -745,7 +930,19 @@ bool GraphColoring::colorGraph()
         // accumulator and update all neighbors
         auto& node = graph.assertNode(*openSet.begin());
         RegisterFile currentFile = RegisterFile::NONE;
-        if(has_flag(node.possibleFiles, RegisterFile::PHYSICAL_B))
+        if(preferAccumulators && node.preferAccumulator && has_flag(node.possibleFiles, RegisterFile::ACCUMULATOR) &&
+            node.hasFreeRegisters(RegisterFile::ACCUMULATOR))
+        {
+            /*
+             * A short-lived multiply product is better off in an accumulator, since the QPU can read an accumulator in
+             * the instruction following its writer, but not a register of file A or B. This is a preference: if no
+             * accumulator is free, the local is assigned to the files below as before. See
+             * #prefersAccumulator().
+             */
+            currentFile = RegisterFile::ACCUMULATOR;
+            PROFILE_COUNTER(vc4c::profiler::COUNTER_BACKEND, "Accumulator preferred (product)", 1);
+        }
+        else if(has_flag(node.possibleFiles, RegisterFile::PHYSICAL_B))
             currentFile = RegisterFile::PHYSICAL_B;
         else if(has_flag(node.possibleFiles, RegisterFile::PHYSICAL_A))
             currentFile = RegisterFile::PHYSICAL_A;
