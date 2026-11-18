@@ -170,6 +170,24 @@ namespace vc4c
             const FastMap<const Local*, LocalUsage>& getLocalUses() const;
             const ColoredGraph& getGraph() const;
 
+            /*!
+             * Returns the locals which could not be assigned to a register by the last call to #colorGraph().
+             *
+             * This is the set of locals which made the coloring fail and can be used to selectively reduce the
+             * register pressure (e.g. by spilling them) before retrying.
+             */
+            const SortedSet<const Local*, LocalIdGreater>& getUnassignedLocals() const;
+
+            /*!
+             * Whether at least one of the locals which could not be assigned to a register would need a value-copy
+             * repair (i.e. is a multi-element vector or a pointer).
+             *
+             * The existing register fix-up steps refuse such a repair and fail the compilation. This predicate allows
+             * the code generator to run the spill/retry path only for those programs which would otherwise fail closed
+             * anyway, so programs that compile through the (scalar) repair steps keep their previous behavior.
+             */
+            bool hasValueCopyConflicts() const;
+
         private:
             Method& method;
             // NOTE: These sets are iterated in the order their elements are taken from. Since the order of the locals

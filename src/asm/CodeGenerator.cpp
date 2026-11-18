@@ -141,6 +141,14 @@ const FastAccessList<DecoratedInstruction>& CodeGenerator::generateInstructions(
     std::unique_ptr<GraphColoring> coloredGraph;
     auto stepIt = fixupSteps.begin();
     FixupResult lastResult = FixupResult::FIXES_APPLIED_RECREATE_GRAPH;
+    // Bounded retry budget for spilling locals which could not be colored. This is intentionally a total budget for
+    // the whole method, not per fix-up step, so a program can never be rewritten/spilled indefinitely.
+    static constexpr unsigned MAX_SPILL_ROUNDS = 4;
+    unsigned spillRoundsLeft = MAX_SPILL_ROUNDS;
+    // Decide once, on the first (pristine) coloring attempt, whether this method is a candidate for spilling. Programs
+    // whose failures can be repaired by the old (scalar) steps keep exactly the previous behavior.
+    bool spillDecisionPending = true;
+    bool spillAllowed = false;
     while(stepIt != fixupSteps.end())
     {
         if(!coloredGraph || lastResult == FixupResult::FIXES_APPLIED_RECREATE_GRAPH)
@@ -153,6 +161,35 @@ const FastAccessList<DecoratedInstruction>& CodeGenerator::generateInstructions(
             // only recolor the graph if we did anything at all
             PROFILE_SCOPE(colorGraph);
             bool hasErrors = !coloredGraph->colorGraph();
+            if(hasErrors && spillDecisionPending)
+            {
+                spillDecisionPending = false;
+                spillAllowed = coloredGraph->hasValueCopyConflicts();
+            }
+            // Before falling back to the other repair steps (which fail closed for vector/pointer locals), try to make
+            // the program colorable by spilling the locals which could not be assigned. Recolor after every round and
+            // stop as soon as the graph is valid.
+            //
+            // This is all-or-nothing and only runs on a program that has not been rewritten by a repair step: if
+            // spilling does not make the whole method colorable, the partially spilled program is NOT handed to the
+            // old repair steps (which could silently rewrite it again). Instead the existing fail-closed error is kept.
+            if(hasErrors && spillAllowed)
+            {
+                bool spilledAnything = false;
+                while(hasErrors && spillRoundsLeft > 0)
+                {
+                    --spillRoundsLeft;
+                    if(spillFailingLocals(method, config, *coloredGraph) == FixupResult::NOTHING_FIXED)
+                        break;
+                    spilledAnything = true;
+                    PROFILE_SCOPE(recolorAfterSpill);
+                    coloredGraph = std::make_unique<GraphColoring>(method, method.walkAllInstructions());
+                    hasErrors = !coloredGraph->colorGraph();
+                }
+                if(hasErrors && spilledAnything)
+                    // still cannot be colored, fail closed instead of letting the repair steps rewrite the program
+                    break;
+            }
             if(!hasErrors)
                 // no more errors
                 break;
