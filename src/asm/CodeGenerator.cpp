@@ -192,6 +192,9 @@ const FastAccessList<DecoratedInstruction>& CodeGenerator::generateInstructions(
         optimizations::removeObsoleteInstructions(module, method, config, registerMapping);
     if(optimizations::Optimizer::isEnabled(optimizations::PASS_PEEPHOLE_COMBINE, config))
         optimizations::combineRegisterMappedOperations(module, method, config, registerMapping);
+    if(optimizations::Optimizer::isEnabled(optimizations::PASS_PEEPHOLE_COMBINE, config))
+        // windowed variant: moves operations on the other ALU up to be combinable (see Peephole.h)
+        optimizations::combineRegisterMappedOperationsWindowed(module, method, config, registerMapping);
 
     // Re-check the register delays with the actual register mapping. The delays inserted before the register-allocation
     // are based on the heuristic whether a local will be mapped to an accumulator (see #splitReadAfterWrites()), which

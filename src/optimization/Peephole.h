@@ -58,6 +58,26 @@ namespace vc4c
         void combineRegisterMappedOperations(const Module& module, Method& kernel, const Configuration& config,
             const FastMap<const Local*, Register>& registerMap);
 
+        /*
+         * Windowed variant of #combineRegisterMappedOperations(): searches the following instructions of the same basic
+         * block for an operation on the other ALU and moves it up to be adjacent to the current one, if it is safe to do
+         * so (no register conflict with the instructions it passes, no flag, label, branch or special register
+         * involved), and combines the two operations afterwards with the same conditions as the direct-neighbour case.
+         *
+         * This is required since the instruction order produced by the register-allocation is not necessarily the one
+         * which allows the two ALUs to be used in the same instruction (e.g. a delay instruction between the two
+         * operations which could co-issue).
+         *
+         * NOTE: Since only plain ALU operations are moved, memory (TMU/VPM) and periphery accesses are never re-ordered,
+         * so a memory request can never be moved in front of the instruction filling its address register.
+         *
+         * NOTE: Like #combineRegisterMappedOperations(), this pass MUST NOT make any changes that require re-building the
+         * register-mapping. The registers of the combined operations are not modified, only their instruction word is
+         * shared.
+         */
+        void combineRegisterMappedOperationsWindowed(const Module& module, Method& kernel, const Configuration& config,
+            const FastMap<const Local*, Register>& registerMap);
+
     } /* namespace optimizations */
 } /* namespace vc4c */
 
