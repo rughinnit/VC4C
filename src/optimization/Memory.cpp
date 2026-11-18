@@ -30,6 +30,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <functional>
 
 using namespace vc4c;
 using namespace vc4c::operators;
@@ -1750,6 +1752,873 @@ std::size_t optimizations::prefetchTMULoads(const Module& module, Method& method
 
     if(numChanges)
         method.cleanEmptyInstructions();
+
+    return numChanges;
+}
+
+/*
+ * TMU load pipelining
+ *
+ * A TMU read is lowered into two instructions: the write of the memory address to the s-coordinate register of the
+ * TMU (which queues the lookup in the "request" FIFO, the TMU then reads the memory asynchronously and pushes the
+ * result into the "receive" FIFO) and - after a signal - the read of the result from r4 (which pops the head of the
+ * receive FIFO). The lowering emits both directly after each other, so the latency of every single lookup is fully
+ * exposed.
+ *
+ * Measurements on the hardware (M21 findings, TMU depth sweep in work/asm/RESULTS.md) show that
+ *  - the useful amount of memory-level parallelism is 2 outstanding requests per TMU, i.e. 4 per QPU when both TMUs
+ *    are used; deeper queues of a single TMU do not reduce the stall time any further, and
+ *  - a pop must never be scheduled in front of the issue of its request: if the request FIFO of a TMU is full, the
+ *    issue blocks and the in-order QPU would never reach the pop that would free the queue again.
+ *
+ * This pass re-orders the requests and value reads inside a single-block loop body, so the requests of the body are
+ * issued as early as possible and their values are popped as late as possible, while never having more than
+ * #maxLoadsInFlight requests of a single TMU in flight. This hides the lookup latency behind the ALU work of the body
+ * (the MACs of a GEMM, which are independent of the loads that are still in flight).
+ *
+ * Safety invariants (all of them are checked, the pass does nothing if one of them cannot be guaranteed):
+ *  - it only ever re-orders instructions inside one basic block, so no barrier, semaphore, label or branch is crossed,
+ *  - every request issued inside the body is also popped inside the body (the TMU queue is empty both when entering
+ *    and when leaving the body, so no request can be left in the queue when the loop is left; this makes the
+ *    transformation independent of the trip count, which only has to be > 1 to be worthwhile),
+ *  - each pop stays directly in front of the read of r4 it belongs to,
+ *  - the issue order and the pop order of each TMU are unchanged (the FIFOs are strictly in-order),
+ *  - for every value read inside the block, the instruction defining it is unchanged (reaching-definition check), and
+ *    for every conditional instruction, the flag-setting instruction it depends on is unchanged,
+ *  - the number of instructions is not changed at all, the pass only re-orders them.
+ *
+ * The pass is disabled by default and can be enabled via the environment variable VC4C_PIPELINE_LOADS=<1..4> (the
+ * number of requests that may be in flight per TMU, default 2) or the optimization pass name "pipeline-tmu-loads".
+ */
+namespace
+{
+    using Instruction = intermediate::IntermediateInstruction;
+
+    // The measured optimum: 2 outstanding requests per TMU, i.e. 4 per QPU if both TMUs are used
+    constexpr unsigned DEFAULT_TMU_LOADS_IN_FLIGHT = 2;
+    // The hardware request FIFO of each TMU is 4 entries deep, more requests in flight would block the issue
+    constexpr unsigned MAX_TMU_LOADS_IN_FLIGHT = 4;
+    // Sanity limit for the number of requests of a single TMU inside one loop body
+    constexpr std::size_t MAX_TMU_REQUESTS_PER_LOOP = 16;
+    // Sanity limit for the number of instructions that are moved together with a request (its address calculation)
+    constexpr std::size_t MAX_REQUEST_SLICE = 96;
+    // The number of tries to move the requests and pops into their final positions
+    constexpr unsigned NUM_SCHEDULING_ROUNDS = 2;
+
+    struct PipelineLoadOptions
+    {
+        bool enabled = false;
+        unsigned maxLoadsInFlight = DEFAULT_TMU_LOADS_IN_FLIGHT;
+    };
+
+    static unsigned parseLoadsInFlight(const char* value)
+    {
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        if(end == value || *end != '\0')
+            return 0;
+        return static_cast<unsigned>(parsed);
+    }
+
+    static PipelineLoadOptions getPipelineLoadOptions(const Configuration& config)
+    {
+        PipelineLoadOptions options;
+        if(config.additionalDisabledOptimizations.find("pipeline-tmu-loads") !=
+            config.additionalDisabledOptimizations.end())
+            return options;
+        if(config.additionalEnabledOptimizations.find("pipeline-tmu-loads") !=
+            config.additionalEnabledOptimizations.end())
+            options.enabled = true;
+
+        if(const char* env = std::getenv("VC4C_PIPELINE_LOADS"))
+        {
+            if(*env == '\0')
+            {
+                // set without a value: enable with the default parameters
+                options.enabled = true;
+            }
+            else
+            {
+                const auto requested = parseLoadsInFlight(env);
+                if(requested < 1 || requested > MAX_TMU_LOADS_IN_FLIGHT)
+                {
+                    CPPLOG_LAZY(logging::Level::WARNING,
+                        log << "Ignoring invalid value '" << env << "' for VC4C_PIPELINE_LOADS, expecting 1 to "
+                            << MAX_TMU_LOADS_IN_FLIGHT << logging::endl);
+                    options.enabled = false;
+                }
+                else
+                {
+                    options.enabled = true;
+                    options.maxLoadsInFlight = requested;
+                }
+            }
+        }
+
+        return options;
+    }
+
+    /*
+     * The requests and value reads of both TMUs of one loop body, in program order.
+     */
+    struct TMUAccesses
+    {
+        std::array<std::vector<Instruction*>, 2> requests;
+        std::array<std::vector<Instruction*>, 2> pops;
+        std::array<std::vector<Instruction*>, 2> reads;
+
+        std::size_t numRequests() const
+        {
+            return requests[0].size() + requests[1].size();
+        }
+    };
+
+    static std::size_t indexOf(const std::vector<Instruction*>& order, const Instruction* instruction)
+    {
+        const auto it = std::find(order.begin(), order.end(), instruction);
+        return static_cast<std::size_t>(it - order.begin());
+    }
+
+    static unsigned getTMUIndex(const Instruction& instruction)
+    {
+        if(instruction.writesRegister(REG_TMU0_ADDRESS))
+            return 0;
+        if(instruction.writesRegister(REG_TMU1_ADDRESS))
+            return 1;
+        return 2;
+    }
+
+    static bool isTMUPop(const Instruction& instruction)
+    {
+        return instruction.getSignal() == SIGNAL_LOAD_TMU0 || instruction.getSignal() == SIGNAL_LOAD_TMU1;
+    }
+
+    static bool isTMUFreeInstruction(const Instruction& instruction)
+    {
+        return getTMUIndex(instruction) > 1 && !isTMUPop(instruction) && !instruction.readsRegister(REG_TMU_OUT);
+    }
+
+    /*
+     * Collects the TMU requests and pops of the block and verifies that they form a self-contained, strictly
+     * alternating sequence per TMU:
+     *   request(0) < pop(0) < request(1) < pop(1) < ...
+     * with each pop directly in front of the read of r4 that consumes the loaded value.
+     */
+    static bool collectTMUAccesses(const std::vector<Instruction*>& order, TMUAccesses& accesses,
+        std::vector<std::string>& reasons)
+    {
+        std::size_t numReads = 0;
+        for(const auto* instruction : order)
+        {
+            const auto tmu = getTMUIndex(*instruction);
+            if(tmu < 2)
+            {
+                accesses.requests[tmu].emplace_back(const_cast<Instruction*>(instruction));
+                continue;
+            }
+            if(isTMUPop(*instruction))
+            {
+                if(instruction->getSignal() == SIGNAL_LOAD_TMU0)
+                    accesses.pops[0].emplace_back(const_cast<Instruction*>(instruction));
+                else
+                    accesses.pops[1].emplace_back(const_cast<Instruction*>(instruction));
+                continue;
+            }
+            if(instruction->readsRegister(REG_TMU_OUT))
+                ++numReads;
+        }
+        if(numReads != accesses.pops[0].size() + accesses.pops[1].size())
+        {
+            reasons.emplace_back("block contains a read of r4 that is not part of a TMU pop");
+            return false;
+        }
+        // a conditionally executed request or pop could leave the TMU queues out of sync (and a request un-popped at
+        // the end of the loop body), which may hang the QPU. Since all instructions of a single-block loop body are
+        // executed unconditionally, this is only a safety net for unexpected input.
+        for(unsigned tmu = 0; tmu < 2; ++tmu)
+        {
+            for(const auto* instruction : accesses.requests[tmu])
+            {
+                if(instruction->hasConditionalExecution())
+                {
+                    reasons.emplace_back("TMU request is executed conditionally");
+                    return false;
+                }
+            }
+            for(const auto* instruction : accesses.pops[tmu])
+            {
+                if(instruction->hasConditionalExecution())
+                {
+                    reasons.emplace_back("TMU pop is executed conditionally");
+                    return false;
+                }
+            }
+        }
+
+        for(unsigned tmu = 0; tmu < 2; ++tmu)
+        {
+            if(accesses.requests[tmu].size() != accesses.pops[tmu].size())
+            {
+                reasons.emplace_back("number of TMU" + std::to_string(tmu) + " requests and pops differ");
+                return false;
+            }
+            if(accesses.requests[tmu].size() > MAX_TMU_REQUESTS_PER_LOOP)
+            {
+                reasons.emplace_back("too many TMU" + std::to_string(tmu) + " requests in the loop body");
+                return false;
+            }
+            for(std::size_t i = 0; i < accesses.requests[tmu].size(); ++i)
+            {
+                const auto requestPos = indexOf(order, accesses.requests[tmu][i]);
+                const auto popPos = indexOf(order, accesses.pops[tmu][i]);
+                if(requestPos >= popPos ||
+                    (i + 1 < accesses.requests[tmu].size() &&
+                        popPos >= indexOf(order, accesses.requests[tmu][i + 1])))
+                {
+                    reasons.emplace_back(
+                        "TMU" + std::to_string(tmu) + " requests and pops are not properly interleaved");
+                    return false;
+                }
+                if(popPos + 1 >= order.size() || !order[popPos + 1]->readsRegister(REG_TMU_OUT))
+                {
+                    reasons.emplace_back("TMU" + std::to_string(tmu) + " pop is not directly followed by a read of r4");
+                    return false;
+                }
+                accesses.reads[tmu].emplace_back(order[popPos + 1]);
+            }
+        }
+
+        return true;
+    }
+
+    /*
+     * Whether the instruction can be moved as part of the address calculation of a memory request.
+     */
+    static bool isPartOfRequestSlice(const Instruction& instruction)
+    {
+        if(!isTMUFreeInstruction(instruction))
+            return false;
+        if(dynamic_cast<const intermediate::BranchLabel*>(&instruction) ||
+            dynamic_cast<const intermediate::Branch*>(&instruction) ||
+            dynamic_cast<const intermediate::MemoryBarrier*>(&instruction) ||
+            dynamic_cast<const intermediate::SemaphoreAdjustment*>(&instruction) ||
+            dynamic_cast<const intermediate::MutexLock*>(&instruction))
+            return false;
+        if(instruction.getSignal() != SIGNAL_NONE)
+            return false;
+        // side effects are only allowed for setting the flags, which discrete address calculations may use
+        if(instruction.hasSideEffects() && !instruction.doesSetFlag())
+            return false;
+        return true;
+    }
+
+    /*
+     * Returns the position of the last instruction before #before that satisfies the given predicate.
+     */
+    template <typename Predicate>
+    static bool findLastWriterBefore(
+        const std::vector<Instruction*>& order, std::size_t before, const Predicate& predicate, std::size_t& position)
+    {
+        for(std::size_t i = before; i-- > 0;)
+        {
+            if(predicate(*order[i]))
+            {
+                position = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /*
+     * Returns the start of the contiguous range of instructions directly in front of the given request that calculate
+     * the address of the request, i.e. the transitive producers of all values (locals and fixed registers, e.g. r5 for
+     * the replicated work-item bases) the request reads.
+     *
+     * Values whose producer is in front of #target do not need to be moved, they can be read at the new position just
+     * as before. All other producers are added to the range, which therefore always contains the complete calculation.
+     *
+     * Conditional instructions also depend on the instruction that set the flags, which is not a data dependency of the
+     * used values but an implicit one, so the range is extended over the complete run of conditional and flag-setting
+     * instructions it contains.
+     *
+     * Returns #requestPosition if the request cannot be moved.
+     */
+    static std::size_t findRequestSliceStart(
+        const std::vector<Instruction*>& order, std::size_t requestPosition, std::size_t target)
+    {
+        std::size_t start = requestPosition;
+        bool changed = true;
+        while(changed)
+        {
+            changed = false;
+
+            FastSet<const Local*> writtenLocals;
+            FastSet<const Local*> neededLocals;
+            FastSet<Register> writtenRegisters;
+            FastSet<Register> neededRegisters;
+            bool usesConditionalExecution = false;
+            for(std::size_t i = start; i <= requestPosition; ++i)
+            {
+                const auto* instruction = order[i];
+                if(instruction->hasConditionalExecution() || instruction->doesSetFlag())
+                    usesConditionalExecution = true;
+                for(const auto& arg : instruction->getArguments())
+                {
+                    if(const auto* local = arg.checkLocal())
+                    {
+                        if(writtenLocals.find(local) == writtenLocals.end())
+                            neededLocals.emplace(local);
+                    }
+                    else if(auto reg = arg.checkRegister())
+                    {
+                        if(writtenRegisters.find(*reg) == writtenRegisters.end())
+                            neededRegisters.emplace(*reg);
+                    }
+                }
+                if(const auto* output = instruction->checkOutputLocal())
+                    writtenLocals.emplace(output);
+                if(auto reg = instruction->checkOutputRegister())
+                    writtenRegisters.emplace(*reg);
+            }
+
+            // extend upwards over the producers of all values that are read from outside the range, as long as they are
+            // calculated behind the target position (values calculated in front of it are simply read as before)
+            for(const auto* local : neededLocals)
+            {
+                std::size_t producer;
+                if(findLastWriterBefore(
+                       order, start, [&](const Instruction& inst) { return inst.checkOutputLocal() == local; },
+                       producer) &&
+                    producer >= target && producer < start)
+                {
+                    start = producer;
+                    changed = true;
+                }
+            }
+            for(const auto& reg : neededRegisters)
+            {
+                std::size_t producer;
+                if(findLastWriterBefore(
+                       order, start,
+                       [&](const Instruction& inst) {
+                           auto outputReg = inst.checkOutputRegister();
+                           return outputReg && *outputReg == reg;
+                       },
+                       producer) &&
+                    producer >= target && producer < start)
+                {
+                    start = producer;
+                    changed = true;
+                }
+            }
+
+            // extend upwards over the whole run of flag-setting/conditional instructions, so the conditionals inside the
+            // range still read the flags set by the instruction that was intended to set them
+            if(usesConditionalExecution)
+            {
+                auto flagStart = start;
+                while(flagStart > 0 &&
+                    (order[flagStart - 1]->doesSetFlag() || order[flagStart - 1]->hasConditionalExecution()))
+                    --flagStart;
+                if(flagStart != start)
+                {
+                    start = flagStart;
+                    changed = true;
+                }
+            }
+        }
+
+        for(std::size_t i = start; i < requestPosition; ++i)
+        {
+            if(!isPartOfRequestSlice(*order[i]))
+                return requestPosition;
+        }
+        return start;
+    }
+
+    /*
+     * Returns whether moving the pop of the given request past the instruction would keep the (per-TMU in-order) TMU
+     * queues valid: no other pop or read of r4 may be crossed and at most #maxLoadsInFlight requests may be in flight,
+     * i.e. the pop may only cross the request directly following its own.
+     */
+    static bool canMovePopAcross(
+        const TMUAccesses& accesses, unsigned tmu, std::size_t requestIndex, const Instruction& instruction)
+    {
+        if(isTMUPop(instruction) || instruction.readsRegister(REG_TMU_OUT))
+            return false;
+        const auto instructionTMU = getTMUIndex(instruction);
+        if(instructionTMU == tmu)
+        {
+            const auto& requests = accesses.requests[tmu];
+            const auto it = std::find(requests.begin(), requests.end(), &instruction);
+            if(it == requests.end())
+                return false;
+            const auto crossedIndex = static_cast<std::size_t>(it - requests.begin());
+            // crossing the request means that it is in flight while this pop has not been executed yet
+            return crossedIndex <= requestIndex + 1;
+        }
+        if(instructionTMU < 2)
+            // a request of the other TMU does not interact with this queue
+            return true;
+        if(instruction.hasSideEffects())
+            return false;
+        return true;
+    }
+
+    /*
+     * Moves the element range [start, end] so that it starts at #target, which must be smaller than #start.
+     */
+    static void moveRangeEarlier(std::vector<Instruction*>& order, std::size_t start, std::size_t end, std::size_t target)
+    {
+        std::vector<Instruction*> range(order.begin() + start, order.begin() + end + 1);
+        order.erase(order.begin() + start, order.begin() + end + 1);
+        order.insert(order.begin() + target, range.begin(), range.end());
+    }
+
+    /*
+     * The instruction defining every value (local and fixed register) read by an instruction, before the re-ordering.
+     */
+    struct ReachingDefinitions
+    {
+        FastMap<const Instruction*, FastMap<const Local*, const Instruction*>> locals;
+        FastMap<const Instruction*, FastMap<Register, const Instruction*>> registers;
+    };
+
+    static ReachingDefinitions calculateReachingDefinitions(const std::vector<Instruction*>& order)
+    {
+        ReachingDefinitions definitions;
+        FastMap<const Local*, const Instruction*> lastLocalWriters;
+        FastMap<Register, const Instruction*> lastRegisterWriters;
+        for(const auto* instruction : order)
+        {
+            auto& readLocals = definitions.locals[instruction];
+            auto& readRegisters = definitions.registers[instruction];
+            for(const auto& arg : instruction->getArguments())
+            {
+                if(const auto* local = arg.checkLocal())
+                {
+                    const auto it = lastLocalWriters.find(local);
+                    readLocals[local] = it == lastLocalWriters.end() ? nullptr : it->second;
+                }
+                else if(auto reg = arg.checkRegister())
+                {
+                    const auto it = lastRegisterWriters.find(*reg);
+                    readRegisters[*reg] = it == lastRegisterWriters.end() ? nullptr : it->second;
+                }
+            }
+            if(const auto* output = instruction->checkOutputLocal())
+                lastLocalWriters[output] = instruction;
+            if(auto output = instruction->checkOutputRegister())
+                lastRegisterWriters[*output] = instruction;
+        }
+        return definitions;
+    }
+
+    /*
+     * The instruction setting the flags a conditional instruction reads, before the re-ordering.
+     */
+    static FastMap<const Instruction*, const Instruction*> calculateFlagSources(const std::vector<Instruction*>& order)
+    {
+        FastMap<const Instruction*, const Instruction*> flagSources;
+        const Instruction* lastFlagSetter = nullptr;
+        for(const auto* instruction : order)
+        {
+            if(instruction->hasConditionalExecution())
+                flagSources[instruction] = lastFlagSetter;
+            if(instruction->doesSetFlag())
+                lastFlagSetter = instruction;
+        }
+        return flagSources;
+    }
+
+    static bool checkReachingDefinitions(
+        const ReachingDefinitions& expected, const std::vector<Instruction*>& order)
+    {
+        FastMap<const Local*, const Instruction*> lastLocalWriters;
+        FastMap<Register, const Instruction*> lastRegisterWriters;
+        for(const auto* instruction : order)
+        {
+            const auto expectedLocals = expected.locals.find(instruction);
+            if(expectedLocals != expected.locals.end())
+            {
+                for(const auto& read : expectedLocals->second)
+                {
+                    const auto it = lastLocalWriters.find(read.first);
+                    const auto* actual = it == lastLocalWriters.end() ? nullptr : it->second;
+                    if(actual != read.second)
+                    {
+                        CPPLOG_LAZY(logging::Level::DEBUG,
+                            log << "Re-ordering would change the definition of '"
+                                << (read.first ? read.first->name : std::string("<unknown>")) << "' read by '"
+                                << instruction->to_string() << "'" << logging::endl);
+                        return false;
+                    }
+                }
+            }
+            const auto expectedRegisters = expected.registers.find(instruction);
+            if(expectedRegisters != expected.registers.end())
+            {
+                for(const auto& read : expectedRegisters->second)
+                {
+                    const auto it = lastRegisterWriters.find(read.first);
+                    const auto* actual = it == lastRegisterWriters.end() ? nullptr : it->second;
+                    if(actual != read.second)
+                    {
+                        CPPLOG_LAZY(logging::Level::DEBUG,
+                            log << "Re-ordering would change the definition of register '" << read.first.to_string()
+                                << "' read by '" << instruction->to_string() << "'" << logging::endl);
+                        return false;
+                    }
+                }
+            }
+            if(const auto* output = instruction->checkOutputLocal())
+                lastLocalWriters[output] = instruction;
+            if(auto output = instruction->checkOutputRegister())
+                lastRegisterWriters[*output] = instruction;
+        }
+        return true;
+    }
+
+    static bool checkFlagSources(const FastMap<const Instruction*, const Instruction*>& expected,
+        const std::vector<Instruction*>& order)
+    {
+        FastMap<const Instruction*, const Instruction*> actualSources;
+        const Instruction* lastFlagSetter = nullptr;
+        for(const auto* instruction : order)
+        {
+            if(instruction->hasConditionalExecution())
+                actualSources[instruction] = lastFlagSetter;
+            if(instruction->doesSetFlag())
+                lastFlagSetter = instruction;
+        }
+        for(const auto& expectedSource : expected)
+        {
+            const auto it = actualSources.find(expectedSource.first);
+            const auto* actual = it == actualSources.end() ? nullptr : it->second;
+            if(actual != expectedSource.second)
+            {
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Re-ordering would change the flags read by '" << expectedSource.first->to_string() << "'"
+                        << logging::endl);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /*
+     * Verifies the TMU queue invariants of the new order: neither the issue order nor the pop order of a TMU is
+     * changed, all requests are popped inside the block, the number of requests in flight never exceeds the limit and
+     * each pop still directly precedes the read of r4 it belongs to.
+     */
+    static bool checkTMUQueues(
+        const std::vector<Instruction*>& order, const TMUAccesses& accesses, unsigned maxLoadsInFlight)
+    {
+        for(unsigned tmu = 0; tmu < 2; ++tmu)
+        {
+            if(accesses.requests[tmu].empty())
+                continue;
+            std::size_t nextRequest = 0;
+            std::size_t nextPop = 0;
+            long outstanding = 0;
+            for(std::size_t i = 0; i < order.size(); ++i)
+            {
+                auto* instruction = order[i];
+                if(getTMUIndex(*instruction) == tmu)
+                {
+                    if(nextRequest >= accesses.requests[tmu].size() ||
+                        accesses.requests[tmu][nextRequest] != instruction)
+                        return false;
+                    ++nextRequest;
+                    ++outstanding;
+                }
+                else if(isTMUPop(*instruction) &&
+                    instruction->getSignal() == (tmu == 0 ? SIGNAL_LOAD_TMU0 : SIGNAL_LOAD_TMU1))
+                {
+                    if(nextPop >= accesses.pops[tmu].size() || accesses.pops[tmu][nextPop] != instruction)
+                        return false;
+                    ++nextPop;
+                    if(outstanding <= 0)
+                        return false;
+                    --outstanding;
+                    if(i + 1 >= order.size() || !order[i + 1]->readsRegister(REG_TMU_OUT))
+                        return false;
+                }
+                if(outstanding > static_cast<long>(maxLoadsInFlight))
+                    return false;
+            }
+            if(nextRequest != accesses.requests[tmu].size() || nextPop != accesses.pops[tmu].size() ||
+                outstanding != 0)
+                return false;
+        }
+        return true;
+    }
+
+    /*
+     * Re-orders the TMU requests and pops of one loop body, so the lookups are started as early as possible and their
+     * results are consumed as late as possible.
+     *
+     * Returns the number of moved instructions.
+     */
+    static std::size_t pipelineLoopBody(
+        const analysis::ControlFlowLoop& loop, BasicBlock& block, const Configuration& config,
+        const PipelineLoadOptions& options)
+    {
+        if(!block.getLabel())
+            return 0;
+
+        // 1. all instructions of the block except for its label, in program order
+        std::vector<InstructionWalker> slots;
+        std::vector<Instruction*> originalOrder;
+        for(auto it = block.walk(); !it.isEndOfBlock(); it.nextInBlock())
+        {
+            if(!it.has())
+                // do not deal with blocks containing already removed instructions
+                return 0;
+            if(it.get<intermediate::BranchLabel>())
+            {
+                if(!originalOrder.empty())
+                    // only the label of the block itself is supported
+                    return 0;
+                continue;
+            }
+            slots.emplace_back(it);
+            originalOrder.emplace_back(it.get());
+        }
+        if(originalOrder.empty())
+            return 0;
+
+        // 2. the loop body must end with its (back edge) branch and must not contain any side effect we cannot move
+        for(std::size_t i = 0; i < originalOrder.size(); ++i)
+        {
+            const auto* instruction = originalOrder[i];
+            if(dynamic_cast<const intermediate::MemoryBarrier*>(instruction) ||
+                dynamic_cast<const intermediate::SemaphoreAdjustment*>(instruction) ||
+                dynamic_cast<const intermediate::MutexLock*>(instruction))
+                return 0;
+            if(dynamic_cast<const intermediate::Branch*>(instruction))
+            {
+                if(i + 1 != originalOrder.size())
+                    return 0;
+                continue;
+            }
+            if(instruction->hasSideEffects() && !instruction->doesSetFlag() && getTMUIndex(*instruction) > 1 &&
+                !isTMUPop(*instruction) && !instruction->readsRegister(REG_TMU_OUT))
+            {
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Not pipelining the TMU loads of loop body '" << block.getLabel()->getLabel()->name
+                        << "': unsupported side effect of '" << instruction->to_string() << "'" << logging::endl);
+                return 0;
+            }
+        }
+
+        // 3. the TMU accesses must be self-contained and properly interleaved
+        TMUAccesses accesses;
+        std::vector<std::string> reasons;
+        if(!collectTMUAccesses(originalOrder, accesses, reasons))
+        {
+            for(const auto& reason : reasons)
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Not pipelining the TMU loads of loop body '" << block.getLabel()->getLabel()->name
+                        << "': " << reason << logging::endl);
+            return 0;
+        }
+        if(accesses.numRequests() < 2 || (accesses.requests[0].size() < 2 && accesses.requests[1].size() < 2))
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not pipelining the TMU loads of loop body '" << block.getLabel()->getLabel()->name
+                    << "': not enough TMU requests" << logging::endl);
+            return 0;
+        }
+
+        // 4. remember which instruction defines every value read and which instruction sets every flag read, so any
+        // invalid re-ordering can be detected and reverted
+        const auto reachingDefinitions = calculateReachingDefinitions(originalOrder);
+        const auto flagSources = calculateFlagSources(originalOrder);
+
+        auto order = originalOrder;
+        auto tryReorder = [&](const std::function<void(std::vector<Instruction*>&)>& reorder) -> bool {
+            auto snapshot = order;
+            reorder(order);
+            if(!checkReachingDefinitions(reachingDefinitions, order) || !checkFlagSources(flagSources, order) ||
+                !checkTMUQueues(order, accesses, options.maxLoadsInFlight))
+            {
+                order = std::move(snapshot);
+                return false;
+            }
+            return true;
+        };
+
+        // 5. move the pops as far down as possible, so the values are only read when they are actually needed. They
+        // are moved starting with the last one, so every pop can move below the ones that were already moved.
+        for(unsigned round = 0; round < NUM_SCHEDULING_ROUNDS; ++round)
+        {
+            for(unsigned tmu = 0; tmu < 2; ++tmu)
+            {
+                for(std::size_t i = accesses.pops[tmu].size(); i-- > 0;)
+                {
+                    auto* pop = accesses.pops[tmu][i];
+                    for(;;)
+                    {
+                        const auto popPosition = indexOf(order, pop);
+                        if(popPosition + 2 >= order.size())
+                            break;
+                        const auto* read = order[popPosition + 1];
+                        const auto* loadedLocal = read->checkOutputLocal();
+                        if(!loadedLocal)
+                            break;
+                        auto* next = order[popPosition + 2];
+                        if(next == pop)
+                            break;
+                        // never move past the next pop of the same TMU
+                        if(i + 1 < accesses.pops[tmu].size() && next == accesses.pops[tmu][i + 1])
+                            break;
+                        if(!canMovePopAcross(accesses, tmu, i, *next))
+                            break;
+                        if(next->readsLocal(loadedLocal) || next->writesLocal(loadedLocal))
+                            break;
+                        if(!tryReorder([&](std::vector<Instruction*>& newOrder) {
+                               moveRangeEarlier(newOrder, popPosition, popPosition + 1, popPosition + 2);
+                           }))
+                            break;
+                    }
+                }
+            }
+        }
+
+        // 6. move every request, together with the calculation of its address, as far up as possible, but not in front
+        // of the request issued before it and not in front of the pop of the request that was issued
+        // #maxLoadsInFlight positions before it (else too many requests would be in flight at the same time)
+        for(unsigned round = 0; round < NUM_SCHEDULING_ROUNDS; ++round)
+        {
+            for(unsigned tmu = 0; tmu < 2; ++tmu)
+            {
+                for(std::size_t i = 1; i < accesses.requests[tmu].size(); ++i)
+                {
+                    auto* request = accesses.requests[tmu][i];
+                    const auto requestPosition = indexOf(order, request);
+                    auto target = indexOf(order, accesses.requests[tmu][i - 1]) + 1;
+                    if(i >= options.maxLoadsInFlight)
+                        target = std::max(target, indexOf(order, accesses.pops[tmu][i - options.maxLoadsInFlight]) + 2);
+                    const auto sliceStart = findRequestSliceStart(order, requestPosition, target);
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "TMU" << tmu << " request " << i << ": position " << requestPosition << ", slice ["
+                            << sliceStart << ", " << requestPosition << "), target " << target << logging::endl);
+                    if(sliceStart >= requestPosition)
+                        continue;
+                    if(requestPosition - sliceStart > MAX_REQUEST_SLICE)
+                        continue;
+                    if(target >= sliceStart)
+                        continue;
+                    tryReorder([&](std::vector<Instruction*>& newOrder) {
+                        moveRangeEarlier(newOrder, sliceStart, requestPosition, target);
+                    });
+                }
+            }
+        }
+
+        // 7. finally, the pops can move down again, since the requests in front of them were moved up
+        for(unsigned tmu = 0; tmu < 2; ++tmu)
+        {
+            for(std::size_t i = accesses.pops[tmu].size(); i-- > 0;)
+            {
+                auto* pop = accesses.pops[tmu][i];
+                for(;;)
+                {
+                    const auto popPosition = indexOf(order, pop);
+                    if(popPosition + 2 >= order.size())
+                        break;
+                    const auto* loadedLocal = order[popPosition + 1]->checkOutputLocal();
+                    if(!loadedLocal)
+                        break;
+                    auto* next = order[popPosition + 2];
+                    if(i + 1 < accesses.pops[tmu].size() && next == accesses.pops[tmu][i + 1])
+                        break;
+                    if(!canMovePopAcross(accesses, tmu, i, *next))
+                        break;
+                    if(next->readsLocal(loadedLocal) || next->writesLocal(loadedLocal))
+                        break;
+                    if(!tryReorder([&](std::vector<Instruction*>& newOrder) {
+                           moveRangeEarlier(newOrder, popPosition, popPosition + 1, popPosition + 2);
+                       }))
+                        break;
+                }
+            }
+        }
+
+        if(order == originalOrder)
+            return 0;
+        if(!checkReachingDefinitions(reachingDefinitions, order) || !checkFlagSources(flagSources, order) ||
+            !checkTMUQueues(order, accesses, options.maxLoadsInFlight))
+            return 0;
+
+        // 8. apply the new order by replacing the instruction at each position
+        FastMap<const Instruction*, std::size_t> slotIndices;
+        for(std::size_t i = 0; i < originalOrder.size(); ++i)
+            slotIndices[originalOrder[i]] = i;
+        std::vector<std::unique_ptr<Instruction>> pool;
+        pool.reserve(slots.size());
+        for(auto& slot : slots)
+            pool.emplace_back(slot.release());
+        for(std::size_t i = 0; i < slots.size(); ++i)
+        {
+            const auto slotIndex = slotIndices[order[i]];
+            slots[i].reset(std::move(pool[slotIndex]));
+        }
+
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Pipelined the TMU loads of loop body '" << block.getLabel()->getLabel()->name << "': "
+                << accesses.numRequests() << " requests, at most " << options.maxLoadsInFlight
+                << " in flight per TMU" << logging::endl);
+
+        return accesses.numRequests();
+    }
+} // namespace
+
+std::size_t optimizations::pipelineTMULoads(const Module& module, Method& method, const Configuration& config)
+{
+    const auto options = getPipelineLoadOptions(config);
+    if(!options.enabled)
+        return 0;
+
+    auto& cfg = method.getCFG();
+    auto loops = cfg.findLoops(false, true);
+    auto dependencyGraph = analysis::DataDependencyGraph::createDependencyGraph(method);
+
+    std::size_t numChanges = 0;
+    for(auto& loop : loops)
+    {
+        // a loop body consisting of a single block cannot contain any conditional memory access, and moving the
+        // instructions inside this block can never cross a branch, barrier or label
+        if(loop.size() != 1)
+            continue;
+        const auto* node = *loop.begin();
+        if(!node || !node->key || !node->key->getLabel())
+            continue;
+
+        // the body must be executed more than once, else there is nothing to overlap. If the trip count cannot be
+        // determined statically, the transformation is still safe (it never leaves a request un-popped at the end of
+        // the body, see #checkTMUQueues), it is only possibly not profitable.
+        auto inductionVariables = loop.findInductionVariables(*dependencyGraph, false);
+        bool tooFewIterations = false;
+        for(const auto& inductionVariable : inductionVariables)
+        {
+            if(auto iterationCount = inductionVariable.getIterationCount())
+            {
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Loop body '" << node->key->getLabel()->getLabel()->name << "' has induction variable '"
+                        << inductionVariable.local->name << "' with " << *iterationCount << " iterations"
+                        << logging::endl);
+                if(*iterationCount <= 1)
+                    tooFewIterations = true;
+            }
+        }
+        if(tooFewIterations)
+            continue;
+
+        numChanges += pipelineLoopBody(loop, *node->key, config, options);
+    }
 
     return numChanges;
 }

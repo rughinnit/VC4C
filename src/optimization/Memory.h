@@ -52,6 +52,21 @@ namespace vc4c
         std::size_t prefetchTMULoads(const Module& module, Method& method, const Configuration& config);
 
         /**
+         * Re-orders the TMU requests and value reads inside single-block loop bodies, so the memory lookups of a loop
+         * iteration are started as early as possible and their results are consumed as late as possible, hiding the
+         * lookup latency behind the calculations of the loop body.
+         *
+         * At most 2 requests per TMU are kept in flight (the measured hardware optimum, both TMUs are used in
+         * parallel), the in-order FIFOs of the TMUs are respected by keeping the issue order and the pop order of each
+         * TMU as well as keeping each pop directly in front of the read of r4 it belongs to.
+         *
+         * NOTE: This optimization re-orders memory accesses and is therefore disabled by default. It can be enabled
+         * via the environment variable VC4C_PIPELINE_LOADS=<number of requests in flight per TMU (1-4), default 2> or
+         * the optimization pass name "pipeline-tmu-loads" (e.g. on the command line).
+         */
+        std::size_t pipelineTMULoads(const Module& module, Method& method, const Configuration& config);
+
+        /**
          * Tries to find and group memory accesses to reduce the number of accesses while increasing utilization.
          */
         std::size_t groupLoweredRegisterAccess(const Module& module, Method& method, const Configuration& config);

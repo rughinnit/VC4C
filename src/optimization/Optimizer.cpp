@@ -289,6 +289,11 @@ const std::vector<OptimizationPass> Optimizer::ALL_PASSES = {
         "merges memory accesses for adjacent memory and cache areas", OptimizationType::INITIAL),
     OptimizationPass("CompactVectorFolding", "compact-vector-folding", compactVectorFolding,
         "optimizes element-wise vector folding with binary-tree folding", OptimizationType::INITIAL),
+    // NOTE: this pass is a no-op unless explicitly requested, see #pipelineTMULoads()
+    OptimizationPass("PipelineTMULoads", "pipeline-tmu-loads", pipelineTMULoads,
+        "issues the read-only TMU loads of a loop body early and reads their values late, to hide the lookup latency "
+        "(disabled by default, enable via VC4C_PIPELINE_LOADS=<requests in flight per TMU, 1-4>)",
+        OptimizationType::INITIAL),
     /*
      * The second block executes optimizations only within a single basic block.
      * These optimizations may be executed in a loop until there are not more changes to the instructions
@@ -363,6 +368,7 @@ std::set<std::string> Optimizer::getPasses(OptimizationLevel level)
         passes.emplace("group-memory");
         passes.emplace("prefetch-loads");
         passes.emplace("compact-vector-folding");
+        passes.emplace("pipeline-tmu-loads");
         passes.emplace("combine-vector-element-copies");
         passes.emplace("vectorize-loops");
         FALL_THROUGH
