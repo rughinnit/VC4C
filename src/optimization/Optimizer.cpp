@@ -294,6 +294,11 @@ const std::vector<OptimizationPass> Optimizer::ALL_PASSES = {
         "issues the read-only TMU loads of a loop body early and reads their values late, to hide the lookup latency "
         "(disabled by default, enable via VC4C_PIPELINE_LOADS=<requests in flight per TMU, 1-4>)",
         OptimizationType::INITIAL),
+    // NOTE: this pass is a no-op unless explicitly requested, see #prefetchTMULoadsAcross()
+    OptimizationPass("PrefetchTMULoadsAcross", "prefetch-tmu-loads-across", prefetchTMULoadsAcross,
+        "issues the first TMU load of the next loop iteration before the back edge, to hide the lookup latency across "
+        "the loop boundary (disabled by default, enable via VC4C_PIPELINE_ACROSS=1)",
+        OptimizationType::INITIAL),
     /*
      * The second block executes optimizations only within a single basic block.
      * These optimizations may be executed in a loop until there are not more changes to the instructions
@@ -369,6 +374,7 @@ std::set<std::string> Optimizer::getPasses(OptimizationLevel level)
         passes.emplace("prefetch-loads");
         passes.emplace("compact-vector-folding");
         passes.emplace("pipeline-tmu-loads");
+        passes.emplace("prefetch-tmu-loads-across");
         passes.emplace("combine-vector-element-copies");
         passes.emplace("vectorize-loops");
         FALL_THROUGH

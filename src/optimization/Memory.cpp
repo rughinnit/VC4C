@@ -7,6 +7,7 @@
 #include "Memory.h"
 
 #include "../Expression.h"
+#include "Compiler.h"
 #include "../GlobalValues.h"
 #include "../Method.h"
 #include "../Module.h"
@@ -32,6 +33,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <limits>
+#include <tuple>
 
 using namespace vc4c;
 using namespace vc4c::operators;
@@ -1899,11 +1902,17 @@ namespace
             }
         }
 
-        // Opt-in: the base address of a gather is kept in a normal register instead of the fixed per-quad register r5.
-        // This lets the pipelining issue such a request a section earlier, but it also costs one register in file A for
-        // the live range of the base, which makes the largest kernels (e.g. r16k8_96, r20k4_120) unallocatable. It is
-        // therefore not enabled together with the pipelining itself.
-        options.normalGatherBase = options.enabled && std::getenv("VC4C_PIPELINE_GATHER_BASE") != nullptr;
+        // Preference: the base address of a gather is kept in a normal register instead of the fixed per-quad register
+        // r5. This lets the pipelining issue such a request a section earlier, but it also costs one register in file A
+        // for the live range of the base, which the largest kernels do not have. Compiler::compile() retries without
+        // this preference when the register allocation fails, so it can be enabled by default without making any kernel
+        // un-compilable. Set VC4C_PIPELINE_GATHER_BASE=0 to force it off.
+        options.normalGatherBase = options.enabled && isNormalGatherBaseAllowed();
+        if(const char* env = std::getenv("VC4C_PIPELINE_GATHER_BASE"))
+        {
+            if(std::string(env) == "0")
+                options.normalGatherBase = false;
+        }
 
         return options;
     }
@@ -2660,6 +2669,963 @@ namespace
 
         return accesses.numRequests();
     }
+    /*
+     * Cross-iteration prefetch of the first TMU request of a loop body.
+     *
+     * The pipelining above issues the requests of a loop iteration early and pops their values late, but the first
+     * request of every iteration can still only be issued after the loop back edge. On a GEMM the first gather is
+     * therefore the only lookup that does not have a whole iteration of ALU work in front of the pop reading it, so
+     * that pop stalls. This pass peels that one request out of the head of the body and issues it at the end of the
+     * previous iteration ("rotation" of the request), so the TMU has almost a whole iteration to complete the lookup.
+     *
+     * The transformation, for the first request of one TMU only:
+     *  - the request and the complete chain calculating its address are moved from the head of the body to just in
+     *    front of the back-edge branch (immediately before the branch's flag-setting instruction),
+     *  - the chain thereby reads the induction variable after its loop-carried update, i.e. it calculates the address
+     *    of the *next* iteration. The value of the induction variable after the (conditional) update is the next value
+     *    when the loop repeats and the current value when the loop exits, so the request of the last iteration
+     *    re-reads the current (in-bounds, already cached) element instead of running past the end of the buffer,
+     *  - a copy of the request chain is inserted into the loop preheader, so the first iteration has something to pop,
+     *  - a single pop is inserted at the start of the loop successor to drain the request left over from the last
+     *    iteration. This is only done if the successor can only be reached through the loop, which makes the body
+     *    execute at least once, so exactly one request is pending.
+     *
+     * Invariants (all verified, the pass does nothing if one cannot be proven):
+     *  - only one request is rotated, and only within a single-block loop body, so no branch, label, barrier,
+     *    semaphore or mutex is crossed and the issue/pop order of each TMU is kept,
+     *  - the in-order FIFO of the TMU is modelled from the request issued in the previous iteration (one outstanding
+     *    on entry) to the request issued at the end (one outstanding on exit); it never exceeds #maxLoadsInFlight,
+     *  - the moved chain is self-contained (it does not calculate values that are used anywhere else) and every
+     *    instruction of it may be re-ordered,
+     *  - all its inputs are either calculated by the chain itself, loop-invariant, or the loop-carried induction
+     *    variable, so no read is hoisted past the instruction that fills it,
+     *  - every instruction that is not moved keeps its reaching definitions and flag sources, every conditional keeps
+     *    its flag source, and no value is read before the instruction filling it,
+     *  - the loop has a preheader and a single successor that is only reachable from inside the loop,
+     *  - the induction variable update is a conditional write of the induction step guarded by the same condition as
+     *    the repeat branch, so the last iteration cannot prefetch out of bounds.
+     *
+     * The pass is disabled by default and can be enabled via the environment variable VC4C_PIPELINE_ACROSS=1 (optionally
+     * VC4C_PIPELINE_ACROSS_TMU=<0|1> to select the TMU, default 0) or the optimization pass name
+     * "prefetch-tmu-loads-across". It requires the in-body pipelining (VC4C_PIPELINE_LOADS) to be enabled.
+     *
+     * NOTE: This is an experiment that is NOT enabled by default: on silicon it is correct but does not improve the
+     * GEMM (the first pop of the loop body is not the latency that limits it); see the commit message for the numbers.
+     */
+    struct AcrossLoopOptions
+    {
+        bool enabled = false;
+        // which TMU's first request to rotate, default TMU0 (the vector gathers of the GEMM)
+        unsigned tmu = 0;
+        unsigned maxLoadsInFlight = DEFAULT_TMU_LOADS_IN_FLIGHT;
+    };
+
+    static AcrossLoopOptions getAcrossLoopOptions(const Configuration& config)
+    {
+        AcrossLoopOptions options;
+        if(config.additionalDisabledOptimizations.find("prefetch-tmu-loads-across") !=
+            config.additionalDisabledOptimizations.end())
+            return options;
+        if(config.additionalEnabledOptimizations.find("prefetch-tmu-loads-across") !=
+            config.additionalEnabledOptimizations.end())
+            options.enabled = true;
+
+        if(const char* env = std::getenv("VC4C_PIPELINE_ACROSS"))
+        {
+            if(*env == '\0' || std::string(env) == "0")
+                options.enabled = false;
+            else
+                options.enabled = true;
+        }
+        if(!options.enabled)
+            return options;
+
+        const auto pipelineOptions = getPipelineLoadOptions(config);
+        if(!pipelineOptions.enabled)
+        {
+            CPPLOG_LAZY(logging::Level::WARNING,
+                log << "VC4C_PIPELINE_ACROSS requires the in-body TMU pipelining (VC4C_PIPELINE_LOADS), ignoring it"
+                    << logging::endl);
+            options.enabled = false;
+            return options;
+        }
+        options.maxLoadsInFlight = pipelineOptions.maxLoadsInFlight;
+
+        if(const char* env = std::getenv("VC4C_PIPELINE_ACROSS_TMU"))
+        {
+            const auto tmu = parseLoadsInFlight(env);
+            if(tmu > 1)
+            {
+                CPPLOG_LAZY(logging::Level::WARNING,
+                    log << "Ignoring invalid value '" << env
+                        << "' for VC4C_PIPELINE_ACROSS_TMU, expecting 0 or 1" << logging::endl);
+            }
+            else
+                options.tmu = tmu;
+        }
+        return options;
+    }
+
+    /*
+     * Collects the TMU requests and pops of an already pipelined block. In contrast to #collectTMUAccesses() this does
+     * not require the strict request(0) < pop(0) < request(1) ... interleaving of the *unpipelined* body: the
+     * pipelining explicitly issues the next request before the previous pop. The in-order FIFO of the re-ordered body
+     * is verified separately by #checkAcrossTMUQueues().
+     */
+    static bool collectTMUAccessesPipelined(const std::vector<Instruction*>& order, TMUAccesses& accesses,
+        std::vector<std::string>& reasons)
+    {
+        std::size_t numReads = 0;
+        for(auto* instruction : order)
+        {
+            const auto tmu = getTMUIndex(*instruction);
+            if(tmu < 2)
+                accesses.requests[tmu].emplace_back(instruction);
+            else if(isTMUPop(*instruction))
+                accesses.pops[instruction->getSignal() == SIGNAL_LOAD_TMU0 ? 0 : 1].emplace_back(instruction);
+            else if(instruction->readsRegister(REG_TMU_OUT))
+                ++numReads;
+        }
+        if(numReads != accesses.pops[0].size() + accesses.pops[1].size())
+        {
+            reasons.emplace_back("block contains a read of r4 that is not part of a TMU pop");
+            return false;
+        }
+        for(unsigned tmu = 0; tmu < 2; ++tmu)
+        {
+            if(accesses.requests[tmu].size() != accesses.pops[tmu].size())
+            {
+                reasons.emplace_back("number of TMU" + std::to_string(tmu) + " requests and pops differ");
+                return false;
+            }
+            if(accesses.requests[tmu].size() > MAX_TMU_REQUESTS_PER_LOOP)
+            {
+                reasons.emplace_back("too many TMU" + std::to_string(tmu) + " requests in the loop body");
+                return false;
+            }
+            for(auto* instruction : accesses.requests[tmu])
+            {
+                if(instruction->hasConditionalExecution())
+                {
+                    reasons.emplace_back("TMU request is executed conditionally");
+                    return false;
+                }
+            }
+            for(auto* pop : accesses.pops[tmu])
+            {
+                if(pop->hasConditionalExecution())
+                {
+                    reasons.emplace_back("TMU pop is executed conditionally");
+                    return false;
+                }
+                const auto popPosition = indexOf(order, pop);
+                if(popPosition + 1 >= order.size() || !order[popPosition + 1]->readsRegister(REG_TMU_OUT))
+                {
+                    reasons.emplace_back("TMU pop is not directly followed by a read of r4");
+                    return false;
+                }
+                accesses.reads[tmu].emplace_back(order[popPosition + 1]);
+            }
+        }
+        return true;
+    }
+
+    /*
+     * The positions of the complete dependency cone of one request within the loop body (the request itself plus
+     * everything calculating its address, including the flag setters read by its conditional instructions).
+     */
+    struct RequestCone
+    {
+        FastSet<std::size_t> positions;
+        std::size_t start = 0;
+        std::size_t end = 0;
+    };
+
+    static bool collectRequestCone(const std::vector<Instruction*>& order, std::size_t requestPosition,
+        const Local* stepInput, RequestCone& cone, std::string& reason)
+    {
+        cone = {};
+        cone.start = requestPosition;
+        cone.end = requestPosition;
+        cone.positions.emplace(requestPosition);
+
+        const auto flagSources = calculateFlagSources(order);
+        FastSet<const Local*> neededLocals;
+        FastSet<Register> neededRegisters;
+        FastSet<const Local*> definedLocals;
+        FastSet<Register> definedRegisters;
+        FastSet<std::size_t> requiredPositions;
+        for(const auto& arg : order[requestPosition]->getArguments())
+        {
+            if(const auto* local = arg.checkLocal())
+                neededLocals.emplace(local);
+            else if(auto reg = arg.checkRegister())
+                neededRegisters.emplace(*reg);
+        }
+
+        for(std::size_t i = requestPosition; i-- > 0;)
+        {
+            const auto* instruction = order[i];
+            const auto* outputLocal = instruction->checkOutputLocal();
+            const auto outputRegister = instruction->checkOutputRegister();
+            if(outputLocal == stepInput)
+                // the copy of the induction variable is intentionally read at the new position instead of being moved
+                continue;
+            bool needed = requiredPositions.find(i) != requiredPositions.end();
+            if(!needed && outputLocal && neededLocals.find(outputLocal) != neededLocals.end())
+                needed = true;
+            if(!needed && outputRegister && neededRegisters.find(*outputRegister) != neededRegisters.end())
+                needed = true;
+            if(!needed)
+                continue;
+            if(!isPartOfRequestSlice(*instruction))
+            {
+                reason = "address calculation contains an instruction that cannot be moved: " +
+                    instruction->to_string();
+                return false;
+            }
+            cone.positions.emplace(i);
+            cone.start = i;
+            if(outputLocal)
+            {
+                neededLocals.erase(outputLocal);
+                definedLocals.emplace(outputLocal);
+            }
+            if(outputRegister)
+            {
+                neededRegisters.erase(*outputRegister);
+                definedRegisters.emplace(*outputRegister);
+            }
+            for(const auto& arg : instruction->getArguments())
+            {
+                if(const auto* local = arg.checkLocal())
+                {
+                    if(definedLocals.find(local) == definedLocals.end())
+                        neededLocals.emplace(local);
+                }
+                else if(auto reg = arg.checkRegister())
+                {
+                    if(definedRegisters.find(*reg) == definedRegisters.end())
+                        neededRegisters.emplace(*reg);
+                }
+            }
+            if(instruction->hasConditionalExecution())
+            {
+                const auto it = flagSources.find(instruction);
+                if(it == flagSources.end() || it->second == nullptr)
+                {
+                    reason = "conditional instruction without a known flag source: " + instruction->to_string();
+                    return false;
+                }
+                requiredPositions.emplace(indexOf(order, it->second));
+                // a conditional write keeps the previous value when the condition is false, so the previous write of
+                // the same local is part of the calculation, too (e.g. the compare chain building the per-lane offsets
+                // of a gather)
+                if(outputLocal)
+                {
+                    for(std::size_t previous = i; previous-- > 0;)
+                    {
+                        if(order[previous]->checkOutputLocal() == outputLocal)
+                        {
+                            requiredPositions.emplace(previous);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // the cone has to be contiguous, only a contiguous range can be moved as a whole
+        for(std::size_t i = cone.start; i <= cone.end; ++i)
+        {
+            if(cone.positions.find(i) == cone.positions.end())
+            {
+                reason = "address calculation is not a contiguous range";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /*
+     * All values that are calculated from the given value inside the block (transitively).
+     */
+    static FastSet<const Local*> collectDerivedLocals(const std::vector<Instruction*>& order, const Local* source)
+    {
+        FastSet<const Local*> derived;
+        derived.emplace(source);
+        bool changed = true;
+        while(changed)
+        {
+            changed = false;
+            for(const auto* instruction : order)
+            {
+                bool readsDerived = false;
+                for(const auto& arg : instruction->getArguments())
+                {
+                    if(const auto* local = arg.checkLocal())
+                    {
+                        if(derived.find(local) != derived.end())
+                        {
+                            readsDerived = true;
+                            break;
+                        }
+                    }
+                }
+                if(!readsDerived)
+                    continue;
+                if(const auto* output = instruction->checkOutputLocal())
+                {
+                    if(derived.find(output) == derived.end())
+                    {
+                        derived.emplace(output);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        return derived;
+    }
+
+    /*
+     * Verifies the reaching definitions of the re-ordered body. Every instruction that is not part of the moved cone
+     * has to read exactly the values it read before. A moved instruction has to read the same values as well, except for
+     * the loop-carried induction variable, which now intentionally resolves to the (conditional) update at the end of
+     * the body instead of the value from before the loop.
+     */
+    static bool checkReachingDefinitionsAcross(const std::vector<Instruction*>& originalOrder,
+        const std::vector<Instruction*>& newOrder, const FastSet<const Instruction*>& moved,
+        const Local* inductionVariable, const Instruction* inductionUpdate)
+    {
+        const auto expected = calculateReachingDefinitions(originalOrder);
+        FastMap<const Local*, const Instruction*> lastLocalWriters;
+        FastMap<Register, const Instruction*> lastRegisterWriters;
+        for(const auto* instruction : newOrder)
+        {
+            const auto expectedLocals = expected.locals.find(instruction);
+            if(expectedLocals != expected.locals.end())
+            {
+                for(const auto& read : expectedLocals->second)
+                {
+                    const auto it = lastLocalWriters.find(read.first);
+                    const auto* actual = it == lastLocalWriters.end() ? nullptr : it->second;
+                    if(actual != read.second)
+                    {
+                        const bool intendedInductionUpdate = moved.find(instruction) != moved.end() &&
+                            read.first == inductionVariable && actual == inductionUpdate;
+                        if(!intendedInductionUpdate)
+                        {
+                            CPPLOG_LAZY(logging::Level::DEBUG,
+                                log << "Cross-iteration prefetch would change the definition of '"
+                                    << (read.first ? read.first->name : std::string("<unknown>")) << "' read by '"
+                                    << instruction->to_string() << "'" << logging::endl);
+                            return false;
+                        }
+                    }
+                }
+            }
+            const auto expectedRegisters = expected.registers.find(instruction);
+            if(expectedRegisters != expected.registers.end())
+            {
+                for(const auto& read : expectedRegisters->second)
+                {
+                    const auto it = lastRegisterWriters.find(read.first);
+                    const auto* actual = it == lastRegisterWriters.end() ? nullptr : it->second;
+                    if(actual != read.second)
+                    {
+                        CPPLOG_LAZY(logging::Level::DEBUG,
+                            log << "Cross-iteration prefetch would change the definition of register '"
+                                << read.first.to_string() << "' read by '" << instruction->to_string() << "'"
+                                << logging::endl);
+                        return false;
+                    }
+                }
+            }
+            if(const auto* output = instruction->checkOutputLocal())
+                lastLocalWriters[output] = instruction;
+            if(auto output = instruction->checkOutputRegister())
+                lastRegisterWriters[*output] = instruction;
+        }
+        return true;
+    }
+
+    /*
+     * Verifies the in-order TMU FIFO of the re-ordered body. The prefetched TMU enters the body with the request issued
+     * in the previous iteration already in flight and leaves it with the request for the next iteration in flight, all
+     * other TMUs are empty on entry and on exit. Neither the issue order nor the pop order may change and no more than
+     * #maxLoadsInFlight requests may be in flight at any point.
+     */
+    static bool checkAcrossTMUQueues(const std::vector<Instruction*>& newOrder, const TMUAccesses& accesses,
+        unsigned prefetchedTMU, unsigned maxLoadsInFlight)
+    {
+        for(unsigned tmu = 0; tmu < 2; ++tmu)
+        {
+            if(accesses.requests[tmu].empty() && accesses.pops[tmu].empty())
+                continue;
+            // the request rotated out of the head is issued after all other requests of this TMU
+            std::vector<Instruction*> expectedRequests;
+            if(tmu == prefetchedTMU && !accesses.requests[tmu].empty())
+            {
+                expectedRequests.insert(
+                    expectedRequests.end(), accesses.requests[tmu].begin() + 1, accesses.requests[tmu].end());
+                expectedRequests.emplace_back(accesses.requests[tmu][0]);
+            }
+            else
+                expectedRequests = accesses.requests[tmu];
+
+            long outstanding = tmu == prefetchedTMU ? 1 : 0;
+            std::size_t nextRequest = 0;
+            std::size_t nextPop = 0;
+            for(std::size_t i = 0; i < newOrder.size(); ++i)
+            {
+                auto* instruction = newOrder[i];
+                if(getTMUIndex(*instruction) == tmu)
+                {
+                    if(nextRequest >= expectedRequests.size() || expectedRequests[nextRequest] != instruction)
+                        return false;
+                    ++nextRequest;
+                    ++outstanding;
+                }
+                else if(isTMUPop(*instruction) &&
+                    instruction->getSignal() == (tmu == 0 ? SIGNAL_LOAD_TMU0 : SIGNAL_LOAD_TMU1))
+                {
+                    if(nextPop >= accesses.pops[tmu].size() || accesses.pops[tmu][nextPop] != instruction)
+                        return false;
+                    ++nextPop;
+                    if(outstanding <= 0)
+                        return false;
+                    --outstanding;
+                    if(i + 1 >= newOrder.size() || !newOrder[i + 1]->readsRegister(REG_TMU_OUT))
+                        return false;
+                }
+                if(outstanding > static_cast<long>(maxLoadsInFlight) || outstanding < 0)
+                    return false;
+            }
+            if(nextRequest != expectedRequests.size() || nextPop != accesses.pops[tmu].size())
+                return false;
+            if(outstanding != (tmu == prefetchedTMU ? 1 : 0))
+                return false;
+        }
+        return true;
+    }
+
+    static bool prefetchFirstRequestAcrossLoop(const analysis::ControlFlowLoop& loop, BasicBlock& block, Method& method,
+        const analysis::DataDependencyGraph& dependencyGraph, const analysis::DominatorTree& dominators,
+        const AcrossLoopOptions& options)
+    {
+        if(!block.getLabel())
+            return false;
+
+        auto preheader = loop.findPreheader(dominators);
+        auto successor = loop.findSuccessor();
+        auto header = loop.getHeader();
+        auto tail = loop.getTail();
+        if(!preheader || !header || !tail || !successor || !successor->key || !successor->key->getLabel() ||
+            !preheader->key || preheader->key == &block || successor->key == &block)
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': no usable preheader/successor" << logging::endl);
+            return false;
+        }
+
+        // The pop draining the prefetched request is inserted into the successor. This is only safe if the successor
+        // can only be reached through the loop, i.e. the body has been executed at least once and exactly one request
+        // is pending.
+        bool successorOnlyReachedFromLoop = true;
+        successor->forAllIncomingEdges([&](const analysis::CFGNode& predecessor, const analysis::CFGEdge&) -> bool {
+            if(loop.find(&predecessor) == loop.end())
+            {
+                successorOnlyReachedFromLoop = false;
+                return false;
+            }
+            return true;
+        });
+        if(!successorOnlyReachedFromLoop)
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': loop successor has predecessors outside of the loop" << logging::endl);
+            return false;
+        }
+        if(!loop.findExitEdge())
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': no single loop exit edge" << logging::endl);
+            return false;
+        }
+
+        // 1. all instructions of the block except for its label, in program order, and the structural checks
+        std::vector<InstructionWalker> slots;
+        std::vector<Instruction*> originalOrder;
+        for(auto it = block.walk(); !it.isEndOfBlock(); it.nextInBlock())
+        {
+            if(!it.has())
+                return false;
+            if(it.get<intermediate::BranchLabel>())
+            {
+                if(!originalOrder.empty())
+                    return false;
+                continue;
+            }
+            slots.emplace_back(it);
+            originalOrder.emplace_back(it.get());
+        }
+        if(originalOrder.size() < 4)
+            return false;
+        for(std::size_t i = 0; i < originalOrder.size(); ++i)
+        {
+            const auto* instruction = originalOrder[i];
+            if(dynamic_cast<const intermediate::MemoryBarrier*>(instruction) ||
+                dynamic_cast<const intermediate::SemaphoreAdjustment*>(instruction) ||
+                dynamic_cast<const intermediate::MutexLock*>(instruction))
+                return false;
+            if(dynamic_cast<const intermediate::Branch*>(instruction) && i + 1 != originalOrder.size())
+                return false;
+        }
+        const auto* branch = dynamic_cast<const intermediate::Branch*>(originalOrder.back());
+        if(!branch || branch->isDynamicBranch() || branch->isUnconditional())
+            return false;
+
+        // 2. the TMU accesses have to be the ones the in-body pipelining produced
+        TMUAccesses accesses;
+        std::vector<std::string> reasons;
+        if(!collectTMUAccessesPipelined(originalOrder, accesses, reasons))
+        {
+            for(const auto& reason : reasons)
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                        << "': " << reason << logging::endl);
+            return false;
+        }
+        const auto tmu = options.tmu;
+        const auto numRequests = tmu <= 1 ? accesses.requests[tmu].size() : 0;
+        if(tmu > 1 || numRequests < 2)
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': TMU" << tmu << " has too few requests" << logging::endl);
+            return false;
+        }
+        auto* request = accesses.requests[tmu][0];
+        const auto requestPosition = indexOf(originalOrder, request);
+        if(requestPosition == 0 || requestPosition + 1 >= originalOrder.size())
+            return false;
+
+        // 3. find the induction variable, its step and the range of values it takes. The request is issued for the
+        // next value, which has to be bounded so the last iteration cannot read past the end of the buffer.
+        Optional<analysis::InductionVariable> induction;
+        const Local* stepInput = nullptr;
+        const Local* stepResult = nullptr;
+        for(const auto& candidate : loop.findInductionVariables(dependencyGraph, true))
+        {
+            if(!candidate.repeatCondition || !candidate.inductionStep)
+                continue;
+            if(!candidate.getLowerBound() || !candidate.getUpperBound() || !candidate.getStep())
+                continue;
+            const Local* input = nullptr;
+            for(const auto& arg : candidate.inductionStep->getArguments())
+            {
+                const auto* local = arg.checkLocal();
+                if(!local)
+                    continue;
+                if(local == candidate.local)
+                {
+                    input = local;
+                    continue;
+                }
+                const auto* writer = local->getSingleWriter();
+                if(writer && writer->isSimpleMove() && writer->readsLocal(candidate.local))
+                    input = local;
+            }
+            const auto* result = candidate.inductionStep->checkOutputLocal();
+            if(!input || !result)
+                continue;
+            induction = candidate;
+            stepInput = input;
+            stepResult = result;
+            break;
+        }
+        if(!induction || !stepInput || !stepResult)
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': no usable induction variable" << logging::endl);
+            return false;
+        }
+        const auto step = induction->getStep();
+        const auto lowerBound = induction->getLowerBound();
+        const auto iterationCount = induction->getIterationCount();
+        if(!step || !lowerBound || !iterationCount || step->signedInt() <= 0 ||
+            induction->inductionStep->op != OP_ADD || *iterationCount < 2 || *iterationCount > (1u << 20))
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': the induction variable does not describe a forward counting loop" << logging::endl);
+            return false;
+        }
+        // the last value the induction variable takes inside the loop. The request for the next iteration is clamped
+        // to this value, so the prefetch of the last iteration re-reads the address of the last iteration instead of
+        // running past the end of the buffer.
+        const auto stepValue = static_cast<long long>(step->signedInt());
+        const auto lowerValue = static_cast<long long>(lowerBound->signedInt());
+        const auto clampValue = lowerValue + static_cast<long long>(*iterationCount - 1) * stepValue;
+        if(clampValue < 0 || clampValue > std::numeric_limits<int32_t>::max())
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': cannot bound the last iteration" << logging::endl);
+            return false;
+        }
+        // the induction variable initialisation has to live in the preheader, so the prologue copy can read it
+        if(!preheader->key->findWalkerForInstruction(induction->initialAssignment))
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': induction variable initialisation is not in the preheader" << logging::endl);
+            return false;
+        }
+
+        // 4. the branch flag setter, the last instruction the request can be inserted in front of
+        std::size_t flagPosition = originalOrder.size() - 1;
+        while(flagPosition > 0 && !originalOrder[flagPosition - 1]->doesSetFlag())
+            --flagPosition;
+        if(flagPosition == 0)
+            return false;
+        auto* branchFlagSetter = originalOrder[flagPosition - 1];
+        if(branchFlagSetter->hasConditionalExecution())
+            return false;
+        const auto branchInsertPosition = flagPosition - 1;
+        if(branchInsertPosition <= requestPosition)
+            return false;
+
+        // 5. the complete, self-contained address calculation of the request
+        RequestCone cone;
+        std::string reason;
+        if(!collectRequestCone(originalOrder, requestPosition, stepInput, cone, reason))
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': " << reason << logging::endl);
+            return false;
+        }
+        if(cone.end - cone.start + 1 > MAX_REQUEST_SLICE || cone.end >= branchInsertPosition)
+            return false;
+        // the cone has to depend on the induction variable, otherwise this is the wrong loop variable
+        bool usesInduction = false;
+        for(auto position : cone.positions)
+        {
+            if(originalOrder[position]->readsLocal(stepInput) || originalOrder[position]->readsLocal(induction->local))
+                usesInduction = true;
+        }
+        if(!usesInduction)
+            return false;
+
+        // 6. no value calculated by the cone may be used outside of it, otherwise it is not self-contained. Registers
+        // (the fixed per-quad register used to broadcast the gather base) are checked by the reaching definitions of
+        // the re-ordered body instead, since they are written many times throughout the body.
+        FastSet<const Local*> coneLocals;
+        for(auto position : cone.positions)
+        {
+            if(const auto* output = originalOrder[position]->checkOutputLocal())
+                coneLocals.emplace(output);
+        }
+        for(std::size_t i = 0; i < originalOrder.size(); ++i)
+        {
+            if(cone.positions.find(i) != cone.positions.end())
+                continue;
+            for(const auto& arg : originalOrder[i]->getArguments())
+            {
+                if(const auto* local = arg.checkLocal())
+                {
+                    if(coneLocals.find(local) != coneLocals.end())
+                    {
+                        CPPLOG_LAZY(logging::Level::DEBUG,
+                            log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                                << "': calculated value '" << local->name << "' is also used by '"
+                                << originalOrder[i]->to_string() << "'" << logging::endl);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // 7. every value read from outside the cone has to be safe to read at the end of the body:
+        //    loop-invariant (defined outside the loop), the loop-carried induction variable itself or the copy of the
+        //    induction variable that is replaced by it. A value calculated from the *current* induction variable inside
+        //    the body (but outside the cone) must not be read, it would be the value of the current iteration.
+        const auto loopDependencies = loop.findLocalDependencies(dependencyGraph);
+        const auto stepDerived = collectDerivedLocals(originalOrder, stepInput);
+        for(auto position : cone.positions)
+        {
+            for(const auto& arg : originalOrder[position]->getArguments())
+            {
+                const auto* local = arg.checkLocal();
+                if(!local)
+                    continue;
+                // find the definition reaching the original position
+                std::size_t writerPosition = ~std::size_t(0);
+                for(std::size_t i = position; i-- > 0;)
+                {
+                    if(originalOrder[i]->checkOutputLocal() == local)
+                    {
+                        writerPosition = i;
+                        break;
+                    }
+                }
+                if(writerPosition != ~std::size_t(0) && cone.positions.find(writerPosition) != cone.positions.end())
+                    // calculated by the cone itself
+                    continue;
+                if(local == stepInput)
+                    // replaced by the next value of the induction variable below
+                    continue;
+                if(local != induction->local && stepDerived.find(local) != stepDerived.end())
+                {
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                            << "': address calculation reads '" << local->name
+                            << "' derived from the current induction variable" << logging::endl);
+                    return false;
+                }
+                if(writerPosition != ~std::size_t(0) && local != induction->local &&
+                    std::find(loopDependencies.begin(), loopDependencies.end(), local) != loopDependencies.end())
+                {
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                            << "': address calculation reads loop-carried value '" << local->name << "'" << logging::endl);
+                    return false;
+                }
+            }
+        }
+
+        // 8. calculate the next value of the induction variable (bounded to the loop range) with two new instructions
+        // and let the address calculation read it instead of the current value
+        const auto nextRaw = method.addNewLocal(stepResult->type, "%across_next");
+        const auto nextClamped = method.addNewLocal(stepResult->type, "%across_next_bounded");
+        intermediate::InlineMapping stepMapping;
+        for(const auto& arg : induction->inductionStep->getArguments())
+        {
+            if(const auto* local = arg.checkLocal())
+                stepMapping[local] = local;
+        }
+        stepMapping[stepResult] = nextRaw.local();
+        auto stepCopy = induction->inductionStep->copyFor(method, "%across_step", stepMapping);
+        auto clampInstruction = std::make_unique<intermediate::Operation>(OP_MIN,
+            Value(nextClamped), Value(nextRaw),
+            Value(Literal(static_cast<uint32_t>(clampValue)), stepResult->type));
+
+        for(auto position : cone.positions)
+        {
+            auto* instruction = originalOrder[position];
+            for(std::size_t i = 0; i < instruction->getArguments().size(); ++i)
+            {
+                if(instruction->getArguments()[i].checkLocal() != stepInput)
+                    continue;
+                instruction->setArgument(i, nextClamped);
+            }
+        }
+
+        std::vector<std::size_t> coneOrder(cone.positions.begin(), cone.positions.end());
+        std::sort(coneOrder.begin(), coneOrder.end());
+        FastSet<const Instruction*> conePointers;
+        for(auto position : coneOrder)
+            conePointers.emplace(originalOrder[position]);
+
+        // 9. candidate insertion points: directly after the pop that leaves at most maxLoadsInFlight-1 requests in
+        // flight (the earliest point that keeps the in-order FIFO valid) up to the branch. The first candidate that
+        // keeps every reaching definition, every flag source and the FIFO valid is used.
+        std::vector<std::size_t> candidates;
+        const auto firstPop = numRequests > options.maxLoadsInFlight ? numRequests - options.maxLoadsInFlight : 0;
+        for(std::size_t i = firstPop; i < numRequests; ++i)
+        {
+            const auto popPosition = indexOf(originalOrder, accesses.pops[tmu][i]);
+            const auto candidate = popPosition + 2;
+            if(candidate > cone.end && candidate < branchInsertPosition &&
+                indexOf(originalOrder, accesses.requests[tmu].back()) < candidate)
+                candidates.emplace_back(candidate);
+        }
+        candidates.emplace_back(branchInsertPosition);
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+        auto buildOrder = [&](std::size_t anchorIndex) {
+            std::vector<Instruction*> order;
+            order.reserve(originalOrder.size() + 2);
+            for(std::size_t i = 0; i < originalOrder.size(); ++i)
+            {
+                if(i == anchorIndex)
+                {
+                    order.emplace_back(stepCopy.get());
+                    order.emplace_back(clampInstruction.get());
+                    for(auto position : coneOrder)
+                        order.emplace_back(originalOrder[position]);
+                }
+                if(cone.positions.find(i) != cone.positions.end())
+                    continue;
+                order.emplace_back(originalOrder[i]);
+            }
+            return order;
+        };
+
+        FastSet<const Instruction*> moved;
+        for(auto position : cone.positions)
+            moved.emplace(originalOrder[position]);
+        const auto flagSources = calculateFlagSources(originalOrder);
+
+        std::size_t chosenAnchor = ~std::size_t(0);
+        for(auto candidate : candidates)
+        {
+            const auto newOrder = buildOrder(candidate);
+            if(checkReachingDefinitionsAcross(
+                   originalOrder, newOrder, moved, nextClamped.local(), clampInstruction.get()) &&
+                checkFlagSources(flagSources, newOrder) &&
+                checkAcrossTMUQueues(newOrder, accesses, tmu, options.maxLoadsInFlight))
+            {
+                chosenAnchor = candidate;
+                break;
+            }
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Cross-iteration prefetch: insertion in front of '" << originalOrder[candidate]->to_string()
+                    << "' does not verify" << logging::endl);
+        }
+        if(chosenAnchor == ~std::size_t(0))
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                    << "': no insertion point keeps the body valid" << logging::endl);
+            return false;
+        }
+
+        // the fixed register written by the prologue copy may not be read by the body before it is written again
+        FastSet<Register> coneRegisters;
+        for(auto position : cone.positions)
+        {
+            if(auto output = originalOrder[position]->checkOutputRegister())
+                coneRegisters.emplace(*output);
+        }
+        for(const auto& reg : coneRegisters)
+        {
+            bool written = false;
+            for(const auto* instruction : originalOrder)
+            {
+                if(conePointers.find(instruction) != conePointers.end())
+                    continue;
+                if(instruction->writesRegister(reg))
+                {
+                    written = true;
+                    break;
+                }
+                if(instruction->readsRegister(reg))
+                {
+                    CPPLOG_LAZY(logging::Level::DEBUG,
+                        log << "Not prefetching across loop body '" << block.getLabel()->getLabel()->name
+                            << "': register '" << reg.to_string() << "' is read before it is written" << logging::endl);
+                    return false;
+                }
+            }
+            (void) written;
+        }
+
+        // 10. apply the new order: take the address calculation out of the head of the body and insert it, together
+        // with the calculation of the next induction value, at the chosen position
+        std::vector<std::unique_ptr<Instruction>> coneStorage;
+        coneStorage.reserve(coneOrder.size());
+        for(auto it = block.walk(); !it.isEndOfBlock();)
+        {
+            if(conePointers.find(it.get()) != conePointers.end())
+            {
+                coneStorage.emplace_back(it.release());
+                it.erase();
+            }
+            else
+                it.nextInBlock();
+        }
+        auto anchorWalker = block.findWalkerForInstruction(originalOrder[chosenAnchor]);
+        if(!anchorWalker)
+        {
+            throw CompilationError(CompilationStep::OPTIMIZER,
+                "Failed to find the insertion point for the cross-iteration TMU prefetch",
+                block.getLabel()->getLabel()->name);
+        }
+        auto anchorIt = *anchorWalker;
+        anchorIt.emplace(std::move(stepCopy));
+        anchorIt.nextInBlock();
+        anchorIt.emplace(std::move(clampInstruction));
+        anchorIt.nextInBlock();
+        for(auto& instruction : coneStorage)
+        {
+            anchorIt.emplace(std::move(instruction));
+            anchorIt.nextInBlock();
+        }
+
+        // 11. issue the request for the first iteration in the preheader. The copy gets its own locals for everything
+        // the chain calculates, so the live ranges of the loop body are not extended by the copy in front of it; the
+        // inputs of the chain that are calculated outside of it keep their locals and the next induction value is
+        // replaced by the initial value of the induction variable.
+        intermediate::InlineMapping identity;
+        FastSet<const Local*> coneOutputs;
+        for(auto position : cone.positions)
+        {
+            if(const auto* output = originalOrder[position]->checkOutputLocal())
+                coneOutputs.emplace(output);
+        }
+        for(auto position : cone.positions)
+        {
+            for(const auto& arg : originalOrder[position]->getArguments())
+            {
+                const auto* local = arg.checkLocal();
+                if(local && coneOutputs.find(local) == coneOutputs.end())
+                    identity[local] = local;
+            }
+            if(const auto* output = originalOrder[position]->checkOutputLocal())
+            {
+                if(identity.find(output) == identity.end())
+                    identity[output] = method.addNewLocal(output->type, "%across_prolog").local();
+            }
+        }
+        identity[nextClamped.local()] = induction->local;
+
+        auto preheaderEnd = preheader->key->walk();
+        while(!preheaderEnd.isEndOfBlock())
+            preheaderEnd.nextInBlock();
+        auto preheaderIt = preheaderEnd.copy();
+        if(!preheaderIt.isStartOfBlock())
+        {
+            preheaderIt.previousInBlock();
+            if(!preheaderIt.get<intermediate::Branch>())
+                preheaderIt = preheaderEnd.copy();
+        }
+        for(auto position : coneOrder)
+        {
+            preheaderIt.emplace(originalOrder[position]->copyFor(method, "", identity));
+            // emplace() inserts in front of the current position, so step over the inserted instruction to append the
+            // next one after it (and not in reverse order)
+            preheaderIt.nextInBlock();
+        }
+
+        // 12. drain the request left over from the last iteration when the loop is left
+        auto* pop = accesses.pops[tmu][0];
+        const auto* popRead = originalOrder[indexOf(originalOrder, pop) + 1];
+        const auto* readLocal = popRead->checkOutputLocal();
+        const auto drainLocal = method.addNewLocal(TYPE_FLOAT.toVectorType(16), "%across_drain");
+        auto successorIt = successor->key->walk();
+        if(successorIt.get<intermediate::BranchLabel>())
+            successorIt.nextInBlock();
+        intermediate::InlineMapping emptyMapping;
+        successorIt.emplace(pop->copyFor(method, "%across_drain", emptyMapping));
+        successorIt.nextInBlock();
+        successorIt.emplace(std::make_unique<intermediate::MoveOperation>(
+            drainLocal, Value(REG_TMU_OUT, readLocal ? readLocal->type : TYPE_FLOAT.toVectorType(16))));
+
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Prefetched the first TMU" << tmu << " request of loop body '" << block.getLabel()->getLabel()->name
+                << "' across the back edge: " << (cone.end - cone.start + 1) << " instructions rotated to in front of '"
+                << originalOrder[chosenAnchor]->to_string() << "', next induction value bounded to " << clampValue
+                << ", at most " << options.maxLoadsInFlight << " requests in flight per TMU" << logging::endl);
+        return true;
+    }
+
 } // namespace
 
 std::size_t optimizations::pipelineTMULoads(const Module& module, Method& method, const Configuration& config)
@@ -2708,6 +3674,35 @@ std::size_t optimizations::pipelineTMULoads(const Module& module, Method& method
 
     return numChanges;
 }
+
+std::size_t optimizations::prefetchTMULoadsAcross(const Module& module, Method& method, const Configuration& config)
+{
+    const auto options = getAcrossLoopOptions(config);
+    if(!options.enabled)
+        return 0;
+
+    auto& cfg = method.getCFG();
+    auto dominators = cfg.getDominatorTree();
+    auto loops = cfg.findLoops(false, true);
+    auto dependencyGraph = analysis::DataDependencyGraph::createDependencyGraph(method);
+
+    std::size_t numChanges = 0;
+    for(auto& loop : loops)
+    {
+        // a loop body consisting of a single block cannot contain any conditional memory access, and moving the
+        // instructions inside this block can never cross a branch, barrier or label
+        if(loop.size() != 1)
+            continue;
+        const auto* node = *loop.begin();
+        if(!node || !node->key || !node->key->getLabel())
+            continue;
+        if(prefetchFirstRequestAcrossLoop(loop, *node->key, method, *dependencyGraph, *dominators, options))
+            ++numChanges;
+    }
+
+    return numChanges;
+}
+
 
 struct LoweredRegisterAccessGroup
 {

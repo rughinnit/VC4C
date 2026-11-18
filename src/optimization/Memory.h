@@ -67,6 +67,24 @@ namespace vc4c
         std::size_t pipelineTMULoads(const Module& module, Method& method, const Configuration& config);
 
         /**
+         * Pre-fetches the first TMU request of the *next* iteration before the loop back edge, so the latency of the
+         * first lookup of an iteration is hidden behind the calculations of the previous one.
+         *
+         * This is the cross-iteration counterpart of #pipelineTMULoads(): it rotates one request (and the complete
+         * calculation of its address) out of the head of a single-block loop body to the end of the body, peels the
+         * request for the first iteration into the loop preheader and drains the request left over after the last
+         * iteration in the loop successor. It preserves the in-order FIFO of each TMU, keeps at most 2 requests in
+         * flight per TMU, never issues more than one request of the rotated TMU before its first pop and bounds the
+         * last iteration so it cannot read past the end of the buffer. Any invariant that cannot be proven makes the
+         * pass keep the original order.
+         *
+         * NOTE: This optimization re-orders memory accesses and is therefore disabled by default. It can be enabled
+         * via the environment variable VC4C_PIPELINE_ACROSS=1 (optionally VC4C_PIPELINE_ACROSS_TMU=<0|1>) or the
+         * optimization pass name "prefetch-tmu-loads-across", and requires #pipelineTMULoads() to be enabled.
+         */
+        std::size_t prefetchTMULoadsAcross(const Module& module, Method& method, const Configuration& config);
+
+        /**
          * Tries to find and group memory accesses to reduce the number of accesses while increasing utilization.
          */
         std::size_t groupLoweredRegisterAccess(const Module& module, Method& method, const Configuration& config);

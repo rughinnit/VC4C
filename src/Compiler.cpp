@@ -25,6 +25,7 @@
 #include "llvm/BitcodeReader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -36,6 +37,27 @@
 #include <vector>
 
 using namespace vc4c;
+
+namespace
+{
+    /*
+     * Process-wide preference for materializing gather base addresses in normal registers (see optimization/Memory.cpp
+     * and Compiler::compile()). It is disabled for the duration of a fallback compilation, so the retry really produces
+     * the code without the preference. It is not part of Configuration to keep the layout of that structure stable for
+     * clients (e.g. VC4CL) that are compiled against another version of the headers.
+     */
+    std::atomic<bool> normalGatherBaseAllowed{true};
+} // namespace
+
+bool vc4c::isNormalGatherBaseAllowed()
+{
+    return normalGatherBaseAllowed.load();
+}
+
+void vc4c::setNormalGatherBaseAllowed(bool allowed)
+{
+    normalGatherBaseAllowed.store(allowed);
+}
 
 // out-of-line virtual method definition
 Parser::~Parser() noexcept = default;
@@ -252,6 +274,44 @@ std::pair<CompilationData, std::size_t> CompilerInstance::generateCode(const Opt
     return std::make_pair(std::move(result), bytesWritten);
 }
 
+namespace
+{
+    std::pair<CompilationData, std::size_t> compileWithConfig(const CompilationData& input, const Configuration& config,
+        const std::string& options, const std::string& outputFile)
+    {
+        CompilerInstance instance{config};
+
+        // pre-compilation
+        instance.precompileAndParseInput(input, options);
+
+        // compilation
+        instance.normalize();
+        instance.optimize();
+        instance.adjust();
+        return instance.generateCode(outputFile.empty() ? Optional<std::string>{} : outputFile);
+    }
+
+    /*
+     * Whether the compilation would materialize the base addresses of gathers in normal registers (see
+     * optimization/Memory.cpp). Only then is a retry without the preference useful.
+     */
+    bool prefersNormalGatherBase(const Configuration& config)
+    {
+        bool pipelining = config.additionalEnabledOptimizations.find("pipeline-tmu-loads") !=
+            config.additionalEnabledOptimizations.end();
+        if(config.additionalDisabledOptimizations.find("pipeline-tmu-loads") !=
+            config.additionalDisabledOptimizations.end())
+            pipelining = false;
+        if(const char* env = std::getenv("VC4C_PIPELINE_LOADS"))
+            pipelining = std::string(env) != "0";
+        if(!pipelining)
+            return false;
+        if(const char* env = std::getenv("VC4C_PIPELINE_GATHER_BASE"))
+            return std::string(env) != "0";
+        return true;
+    }
+} // namespace
+
 std::pair<CompilationData, std::size_t> Compiler::compile(const CompilationData& input, const Configuration& config,
     const std::string& options, const std::string& outputFile)
 {
@@ -262,16 +322,28 @@ std::pair<CompilationData, std::size_t> Compiler::compile(const CompilationData&
         Configuration effectiveConfig{config};
         if(effectiveConfig.workItemMergeFactor == 0)
             effectiveConfig.workItemMergeFactor = getWorkItemMergeFactorFromEnv();
-        CompilerInstance instance{effectiveConfig};
 
-        // pre-compilation
-        instance.precompileAndParseInput(input, options);
-
-        // compilation
-        instance.normalize();
-        instance.optimize();
-        instance.adjust();
-        auto result = instance.generateCode(outputFile.empty() ? Optional<std::string>{} : outputFile);
+        std::pair<CompilationData, std::size_t> result;
+        try
+        {
+            result = compileWithConfig(input, effectiveConfig, options, outputFile);
+        }
+        catch(const CompilationError& e)
+        {
+            // Preference-with-fallback: the gather base in a normal register is only a scheduling improvement. If the
+            // register allocation cannot afford it, compile the kernel again without it instead of rejecting it.
+            if(!prefersNormalGatherBase(effectiveConfig) ||
+                std::string(e.what()).find("register-conflict") == std::string::npos)
+                throw;
+            logging::warn() << "Compilation failed with the gather base in a normal register (" << e.what()
+                            << "), retrying without it" << logging::endl;
+            struct GatherBasePreference
+            {
+                GatherBasePreference() { setNormalGatherBaseAllowed(false); }
+                ~GatherBasePreference() { setNormalGatherBaseAllowed(true); }
+            } preferenceOff;
+            result = compileWithConfig(input, effectiveConfig, options, outputFile);
+        }
 
         // clean-up
         std::wcout.flush();

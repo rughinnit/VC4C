@@ -17,6 +17,14 @@
 
 namespace vc4c
 {
+    /*
+     * Process-wide preference for materializing gather base addresses in normal registers. Compiler::compile() clears
+     * it for the fallback compilation when the register allocation cannot afford the preference. Not part of
+     * Configuration, to keep the layout of that structure stable for clients compiled against other header versions.
+     */
+    bool isNormalGatherBaseAllowed();
+    void setNormalGatherBaseAllowed(bool allowed);
+
     /*!
      * The log-level
      * (see cpplog log-levels)
