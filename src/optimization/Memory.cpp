@@ -884,11 +884,51 @@ NODISCARD static InstructionWalker findGroupOfTMUAccess(InstructionWalker it, TM
     return it;
 }
 
+namespace
+{
+    /*
+     * Whether the gather base addresses are materialized in a normal register instead of the fixed per-quad register
+     * (see #pipelineTMULoads()), defined together with the rest of its configuration further down.
+     */
+    static bool isNormalGatherBaseEnabled(const Configuration& config);
+}
+
+/*
+ * Whether the value is a single base address, i.e. one address for all lanes, so it does not have to be broadcast
+ * through the fixed per-quad register r5.
+ *
+ * Only pointers are accepted: after the vectorization, a scalar float or integer is the value of a single SIMD element
+ * (e.g. the result of a vector rotation), so broadcasting it through r5 is semantically required. A pointer is never
+ * produced by a rotation, and a pointer that is one per lane is encoded by vc4c as a pointer to a full SIMD vector of
+ * integers, so those are rejected as well.
+ */
+static bool isSingleBaseAddress(const Value& value)
+{
+    const auto* pointerType = value.type.getPointerType();
+    if(pointerType == nullptr)
+        return false;
+    return pointerType->elementType != TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE);
+}
+
 NODISCARD static InstructionWalker insertCustomAddressesCalculation(InstructionWalker it, Method& method,
-    const Value& baseAddress, const Value& addressOffsets, uint8_t numVectorElements, const Value& outputAddress)
+    const Value& baseAddress, const Value& addressOffsets, uint8_t numVectorElements, const Value& outputAddress,
+    bool useNormalRegisterForBase)
 {
     Value replicatedAddress = baseAddress;
-    if(!baseAddress.isAllSame())
+    /*
+     * A single base address (one pointer for all lanes) does not have to be broadcast from one quad to all of its
+     * lanes: a normal register holds it just as well, so the addition below can read it as a scalar operand. The
+     * broadcast is what needs the fixed per-quad register r5, and since r5 is also the register the vector rotations
+     * of the surrounding code use to extract single vector elements, every gather that is built on top of an r5 fill
+     * can only be moved together with that fill - which is what keeps the TMU pipelining from issuing such a request a
+     * section earlier.
+     *
+     * Only done when it is explicitly requested together with the load pipelining (VC4C_PIPELINE_GATHER_BASE), so the
+     * generated code of every other kernel stays unchanged: the base then occupies a general-purpose register instead
+     * of the fixed one, which some of the largest kernels do not have left.
+     */
+    const bool useNormalRegister = useNormalRegisterForBase && isSingleBaseAddress(baseAddress);
+    if(!baseAddress.isAllSame() && !useNormalRegister)
     {
         replicatedAddress = method.addNewLocal(
             method.createPointerType(TYPE_INT32.toVectorType(NATIVE_VECTOR_SIZE)), "%tmu_group_replicated_address");
@@ -1105,7 +1145,7 @@ static Optional<HierarchicalStrides> checkTwoDistinctStrides(const std::vector<S
     return {};
 }
 
-NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
+NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group, bool useNormalRegisterForBase)
 {
     if(group.ramReads.size() != group.cacheLoads.size())
     {
@@ -1193,7 +1233,7 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
 
         auto initialRAMLoad = group.ramReads.front().get();
         it = insertCustomAddressesCalculation(it, method, initialRAMLoad->getMemoryAddress(), customAddressOffsets,
-            group.usedVectorSize, group.cacheEntry->addresses);
+            group.usedVectorSize, group.cacheEntry->addresses, useNormalRegisterForBase);
         group.cacheEntry->customAddressCalculation = true;
         initialRAMLoad->setMemoryAddress(group.cacheEntry->addresses);
     }
@@ -1226,7 +1266,7 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
 
         auto initialRAMLoad = group.ramReads.front().get();
         it = insertCustomAddressesCalculation(it, method, initialRAMLoad->getMemoryAddress(), customAddressOffsets,
-            group.usedVectorSize, group.cacheEntry->addresses);
+            group.usedVectorSize, group.cacheEntry->addresses, useNormalRegisterForBase);
         group.cacheEntry->customAddressCalculation = true;
         initialRAMLoad->setMemoryAddress(group.cacheEntry->addresses);
     }
@@ -1280,7 +1320,7 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
         it = intrinsics::insertMultiplication(it, method, ELEMENT_NUMBER_REGISTER, elementStride, customAddressOffsets);
 
         it = insertCustomAddressesCalculation(it, method, initialRAMLoad->getMemoryAddress(), customAddressOffsets,
-            group.usedVectorSize, group.cacheEntry->addresses);
+            group.usedVectorSize, group.cacheEntry->addresses, useNormalRegisterForBase);
         group.cacheEntry->customAddressCalculation = true;
         initialRAMLoad->setMemoryAddress(group.cacheEntry->addresses);
     }
@@ -1350,7 +1390,7 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
 
         // full address = base (first RAM load address) + full offset
         it = insertCustomAddressesCalculation(it, method, initialRAMLoad->getMemoryAddress(), customAddressOffsets,
-            group.usedVectorSize, group.cacheEntry->addresses);
+            group.usedVectorSize, group.cacheEntry->addresses, useNormalRegisterForBase);
         group.cacheEntry->customAddressCalculation = true;
         initialRAMLoad->setMemoryAddress(group.cacheEntry->addresses);
     }
@@ -1412,6 +1452,7 @@ NODISCARD static bool groupTMUReads(Method& method, TMUAccessGroup& group)
 std::size_t optimizations::groupTMUAccess(const Module& module, Method& method, const Configuration& config)
 {
     std::size_t numChanges = 0;
+    const bool useNormalRegisterForBase = isNormalGatherBaseEnabled(config);
 
     // run within all basic blocks
     for(auto& block : method)
@@ -1423,7 +1464,7 @@ std::size_t optimizations::groupTMUAccess(const Module& module, Method& method, 
             it = findGroupOfTMUAccess(it, group);
             if(group.ramReads.size() > 1)
             {
-                if(groupTMUReads(method, group))
+                if(groupTMUReads(method, group, useNormalRegisterForBase))
                 {
                     ++numChanges;
                     PROFILE_COUNTER(vc4c::profiler::COUNTER_OPTIMIZATION, "TMU access groups", group.ramReads.size());
@@ -1809,6 +1850,9 @@ namespace
     {
         bool enabled = false;
         unsigned maxLoadsInFlight = DEFAULT_TMU_LOADS_IN_FLIGHT;
+        // materialize single gather base addresses in a normal register instead of the fixed per-quad register (opt-in,
+        // see #insertCustomAddressesCalculation())
+        bool normalGatherBase = false;
     };
 
     static unsigned parseLoadsInFlight(const char* value)
@@ -1855,7 +1899,18 @@ namespace
             }
         }
 
+        // Opt-in: the base address of a gather is kept in a normal register instead of the fixed per-quad register r5.
+        // This lets the pipelining issue such a request a section earlier, but it also costs one register in file A for
+        // the live range of the base, which makes the largest kernels (e.g. r16k8_96, r20k4_120) unallocatable. It is
+        // therefore not enabled together with the pipelining itself.
+        options.normalGatherBase = options.enabled && std::getenv("VC4C_PIPELINE_GATHER_BASE") != nullptr;
+
         return options;
+    }
+
+    static bool isNormalGatherBaseEnabled(const Configuration& config)
+    {
+        return getPipelineLoadOptions(config).normalGatherBase;
     }
 
     /*
@@ -2141,6 +2196,12 @@ namespace
      * Returns whether moving the pop of the given request past the instruction would keep the (per-TMU in-order) TMU
      * queues valid: no other pop or read of r4 may be crossed and at most #maxLoadsInFlight requests may be in flight,
      * i.e. the pop may only cross the request directly following its own.
+     *
+     * A pop is a pure read of the receive FIFO of its TMU, so it may also cross instructions that only set the flags
+     * (such as the compare chain that builds the per-lane address offsets of the gathers), although those have side
+     * effects. What a pop must not cross are instructions with a real side effect (stores, barriers, semaphores); the
+     * reaching definition of every value it and its read of r4 use is verified separately, and the flag sources of all
+     * conditionals are checked after every move.
      */
     static bool canMovePopAcross(
         const TMUAccesses& accesses, unsigned tmu, std::size_t requestIndex, const Instruction& instruction)
@@ -2161,7 +2222,7 @@ namespace
         if(instructionTMU < 2)
             // a request of the other TMU does not interact with this queue
             return true;
-        if(instruction.hasSideEffects())
+        if(instruction.hasSideEffects() && !instruction.doesSetFlag())
             return false;
         return true;
     }
@@ -2450,6 +2511,29 @@ namespace
             return true;
         };
 
+        // Debug aid: print the body with the marks of the scheduler, so a decision can be reproduced by hand.
+        // Enabled with VC4C_PIPELINE_DUMP=1, otherwise it does nothing.
+        const bool dumpOrderEnabled = std::getenv("VC4C_PIPELINE_DUMP") != nullptr;
+        auto dumpOrder = [&](const char* phase) {
+            if(!dumpOrderEnabled)
+                return;
+            CPPLOG_LAZY(logging::Level::DEBUG,
+                log << "TMU load pipelining " << phase << " of loop body '"
+                    << block.getLabel()->getLabel()->name << "':" << logging::endl);
+            for(std::size_t i = 0; i < order.size(); ++i)
+            {
+                const auto* instruction = order[i];
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "  " << i << ": " << instruction->to_string() << (instruction->doesSetFlag() ? " [setf]" : "")
+                        << (instruction->hasConditionalExecution() ? " [cond]" : "")
+                        << (instruction->hasSideEffects() ? " [side]" : "")
+                        << (isTMUPop(*instruction) ? " [pop]" : "")
+                        << (getTMUIndex(*instruction) < 2 ? " [request]" : "") << logging::endl);
+            }
+        };
+
+        dumpOrder("before re-ordering");
+
         // 5. move the pops as far down as possible, so the values are only read when they are actually needed. They
         // are moved starting with the last one, so every pop can move below the ones that were already moved.
         for(unsigned round = 0; round < NUM_SCHEDULING_ROUNDS; ++round)
@@ -2552,6 +2636,8 @@ namespace
         if(!checkReachingDefinitions(reachingDefinitions, order) || !checkFlagSources(flagSources, order) ||
             !checkTMUQueues(order, accesses, options.maxLoadsInFlight))
             return 0;
+
+        dumpOrder("after re-ordering");
 
         // 8. apply the new order by replacing the instruction at each position
         FastMap<const Instruction*, std::size_t> slotIndices;
