@@ -144,6 +144,21 @@ namespace vc4c
          */
         FixupResult spillLocals(Method& method, const Configuration& config, GraphColoring& coloredGraph);
 
+        /**
+         * Reduces register pressure in response to an actual coloring failure by spilling the locals which could not be
+         * assigned a register.
+         *
+         * In contrast to #spillLocals(), this does not use the heuristics for "long-living and rarely used" locals (which
+         * intentionally ignores most locals), but selects the locals reported as unassignable by the last call to
+         * GraphColoring::colorGraph(), starting with the ones with the highest interference degree. This is meant to be
+         * called in a bounded retry loop: spill a few locals, recolor, and repeat until the graph colors or no more
+         * candidates are left.
+         *
+         * Returns FIXES_APPLIED_RECREATE_GRAPH if at least one local was spilled and the graph must be recreated,
+         * NOTHING_FIXED otherwise (including when no spillable candidate exists or the VPM is full).
+         */
+        FixupResult spillFailingLocals(Method& method, const Configuration& config, GraphColoring& coloredGraph);
+
     } // namespace qpu_asm
 
 } // namespace vc4c

@@ -879,7 +879,7 @@ struct LocalAccessGroup
 static std::vector<LocalAccessGroup> groupSpillAccesses(
     const tools::SmallSortedPointerMap<const LocalUser*, LocalUse>& users,
     const FastMap<const intermediate::IntermediateInstruction*, InstructionWalker>& instructionMapping,
-    std::size_t threshold)
+    std::size_t threshold, bool allowSingleGroup = false)
 {
     // mapping of access to its previous access
     tools::SmallSortedPointerMap<const LocalUser*, const LocalUser*> accessOrder;
@@ -916,7 +916,7 @@ static std::vector<LocalAccessGroup> groupSpillAccesses(
             }
         }
     }
-    if(groups.size() <= 1)
+    if(groups.size() <= 1 && !allowSingleGroup)
     {
         // Sanity check, should never happen due to how we select locals to spill, but just to be sure don't spill
         // locals which are only used in a single group
@@ -931,6 +931,163 @@ static std::vector<LocalAccessGroup> groupSpillAccesses(
     }
     return result;
 }
+
+namespace
+{
+    using InstructionMapping = FastMap<const intermediate::IntermediateInstruction*, InstructionWalker>;
+    using SpilledAreaMap = FastMap<const periphery::VPMArea*, tools::SmallSortedPointerSet<const ColoredNode*>>;
+
+    enum class SpillLocalResult
+    {
+        SPILLED,
+        // the VPM is exhausted, no further local can be spilled
+        NO_SPACE,
+        // this local cannot be spilled (e.g. its accesses cannot be grouped), try the next one
+        SKIPPED
+    };
+
+    /*
+     * Spills a single local into a (new or reused) VPM row, replacing all its accesses by short-living temporaries.
+     *
+     * The spill area is indexed by the hardware QPU number, so every QPU has its own row and no two work-items
+     * interfere with each other. The accesses are inserted at the exact (grouped) positions they are used, so this
+     * also works for locals whose live range spans a loop.
+     */
+    SpillLocalResult spillLocal(Method& method, const Configuration& config, GraphColoring& coloredGraph,
+        const Local* loc, float rating, bool allowSingleGroup, InstructionMapping& instructionMapping,
+        SpilledAreaMap& spilledAreas)
+    {
+        if(instructionMapping.empty())
+        {
+            // create this mapping once to not need to iterate over all instructions again and again
+            for(auto it = method.walkAllInstructions(); !it.isEndOfMethod(); it.nextInMethod())
+            {
+                if(auto combinedOp = it.get<intermediate::CombinedOperation>())
+                {
+                    if(auto op = combinedOp->getFirstOp())
+                        instructionMapping.emplace(op, it);
+                    if(auto op = combinedOp->getSecondOp())
+                        instructionMapping.emplace(op, it);
+                }
+                else if(it.has())
+                    instructionMapping.emplace(it.get(), it);
+            }
+        }
+
+        // since we modify the users, need to create a copy first
+        auto accessGroups = groupSpillAccesses(
+            loc->getUsers(), instructionMapping, config.additionalOptions.accumulatorThreshold, allowSingleGroup);
+        if(accessGroups.empty())
+            // no useful access group, e.g. the local is only written or all of its accesses are in one group
+            return SpillLocalResult::SKIPPED;
+
+        const auto& localNode = coloredGraph.getGraph().assertNode(loc);
+        const periphery::VPMArea* spillArea = nullptr;
+        for(const auto& entry : spilledAreas)
+        {
+            // Try to find an already allocated spill are which is not used by any local interfering with the
+            // current local ...
+            if(std::none_of(entry.second.begin(), entry.second.end(),
+                   [&localNode](const ColoredNode* spilledNode) { return localNode.isAdjacent(spilledNode); }))
+            {
+                CPPLOG_LAZY(logging::Level::DEBUG,
+                    log << "Reusing spill VPM rows for '" << loc->name << "', previously used by: "
+                        << to_string<const ColoredNode*>(
+                               entry.second, [](const ColoredNode* node) { return node->key->to_string(); })
+                        << logging::endl);
+                spillArea = entry.first;
+                break;
+            }
+        }
+
+        if(!spillArea)
+            // ... otherwise try to allocate a new spill area
+            spillArea = method.vpm->addSpillArea(method.metaData.getMaximumInstancesCount());
+        if(!spillArea)
+        {
+            CPPLOG_LAZY(logging::Level::DEBUG, log << "No more space in VPM, aborting spilling!" << logging::endl);
+            return SpillLocalResult::NO_SPACE;
+        }
+
+        spilledAreas[spillArea].emplace(&localNode);
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Spilling local '" << loc->name << "' with rating: " << rating << logging::endl);
+
+        for(auto& group : accessGroups)
+        {
+            auto it = group.mainAccess;
+            bool mutexAlreadyLocked = isInMutexLock(it);
+            // Since the qpu_number register is on register-file B, need to split the offset calculation up
+            auto qpuNum = assign(it, TYPE_INT8, "%spill_qpu_offset") = Value(REG_QPU_NUMBER, TYPE_INT8);
+            auto offset = assign(it, TYPE_INT8, "%spill_qpu_offset") = qpuNum * 64_lit; // 16 elements * 4Byte
+            Value groupValue = UNDEFINED_VALUE;
+            auto groupValueType =
+                (loc->type.getPointerType() ? TYPE_INT32 : loc->type).toVectorType(NATIVE_VECTOR_SIZE);
+            if(group.mainAccessUse.readsLocal())
+            {
+                // insert read from VPM before access and replace the local with a temporary
+                groupValue = method.addNewLocal(groupValueType, loc->name, "spill_read");
+                auto beforeIt = it.copy().previousInBlock();
+                it = method.vpm->insertReadVPM(method, it, groupValue, *spillArea, !mutexAlreadyLocked, offset);
+                it->replaceValue(loc->createReference(), groupValue, LocalUse::Type::READER);
+                auto lowerIt = beforeIt;
+                while(lowerIt != it && !lowerIt.isEndOfBlock())
+                    lowerIt = periphery::lowerVPMAccess(method, lowerIt).nextInBlock();
+                while(beforeIt != it && !beforeIt.isEndOfBlock())
+                    beforeIt = normalization::handleImmediate(method.module, method, beforeIt, config).nextInBlock();
+            }
+            if(group.mainAccessUse.writesLocal())
+            {
+                // insert write to VPM after access and replace the local with a temporary
+                groupValue = method.addNewLocal(groupValueType, loc->name, "spill_write");
+                auto beforeIt = it.copy().previousInBlock();
+                it->replaceValue(loc->createReference(), groupValue, LocalUse::Type::WRITER);
+                it.nextInBlock();
+                it = method.vpm->insertWriteVPM(method, it, groupValue, *spillArea, !mutexAlreadyLocked, offset);
+                auto lowerIt = beforeIt;
+                while(lowerIt != it && !lowerIt.isEndOfBlock())
+                    lowerIt = periphery::lowerVPMAccess(method, lowerIt).nextInBlock();
+                while(beforeIt != it && !beforeIt.isEndOfBlock())
+                    beforeIt = normalization::handleImmediate(method.module, method, beforeIt, config).nextInBlock();
+            }
+            for(auto* reader : group.additionalReaders)
+            {
+                reader->replaceLocal(loc, groupValue, LocalUse::Type::READER);
+            }
+        }
+
+        PROFILE_COUNTER_SCOPE(
+            vc4c::profiler::COUNTER_BACKEND, "Locals spilled", method.metaData.getMaximumInstancesCount());
+        return SpillLocalResult::SPILLED;
+    }
+
+    /*
+     * Spills the given locals (in order) and reports whether the register graph needs to be recreated.
+     */
+    FixupResult runSpillCandidates(Method& method, const Configuration& config, GraphColoring& coloredGraph,
+        const std::vector<std::pair<const Local*, float>>& candidates, bool allowSingleGroup)
+    {
+        bool spilledLocals = false;
+
+        InstructionMapping instructionMapping(method.countInstructions());
+        SpilledAreaMap spilledAreas;
+
+        for(const auto& candidate : candidates)
+        {
+            auto result = spillLocal(
+                method, config, coloredGraph, candidate.first, candidate.second, allowSingleGroup, instructionMapping,
+                spilledAreas);
+            if(result == SpillLocalResult::NO_SPACE)
+                break;
+            if(result == SpillLocalResult::SPILLED)
+                spilledLocals = true;
+        }
+
+        CPPLOG_LAZY_BLOCK(logging::Level::DEBUG, method.vpm->dumpUsage());
+        method.dumpInstructions();
+        return spilledLocals ? FixupResult::FIXES_APPLIED_RECREATE_GRAPH : FixupResult::NOTHING_FIXED;
+    }
+} // namespace
 
 FixupResult qpu_asm::spillLocals(Method& method, const Configuration& config, GraphColoring& coloredGraph)
 {
@@ -961,125 +1118,69 @@ FixupResult qpu_asm::spillLocals(Method& method, const Configuration& config, Gr
         spillCandidates[calculateRating(entry.second, *loopInclusions, graphNode)].emplace(entry.first);
     }
 
-    bool spilledLocals = false;
-    bool noMoreSpace = false;
-
-    FastMap<const intermediate::IntermediateInstruction*, InstructionWalker> instructionMapping(
-        method.countInstructions());
-
-    FastMap<const periphery::VPMArea*, tools::SmallSortedPointerSet<const ColoredNode*>> spilledAreas;
-
+    std::vector<std::pair<const Local*, float>> orderedCandidates;
+    orderedCandidates.reserve(spillCandidates.size());
     for(const auto& entry : spillCandidates)
     {
         for(const auto* loc : entry.second)
-        {
-            const periphery::VPMArea* spillArea = nullptr;
-            const auto& localNode = coloredGraph.getGraph().assertNode(loc);
-            for(const auto& entry : spilledAreas)
-            {
-                // Try to find an already allocated spill are which is not used by any local interfering with the
-                // current local ...
-                if(std::none_of(entry.second.begin(), entry.second.end(),
-                       [&localNode](const ColoredNode* spilledNode) { return localNode.isAdjacent(spilledNode); }))
-                {
-                    CPPLOG_LAZY(logging::Level::DEBUG,
-                        log << "Reusing spill VPM rows for '" << loc->name << "', previously used by: "
-                            << to_string<const ColoredNode*>(
-                                   entry.second, [](const ColoredNode* node) { return node->key->to_string(); })
-                            << logging::endl);
-                    spillArea = entry.first;
-                    break;
-                }
-            }
-
-            if(!spillArea)
-                // ... otherwise try to allocate a new spill area
-                spillArea = method.vpm->addSpillArea(method.metaData.getMaximumInstancesCount());
-            if(!spillArea)
-            {
-                CPPLOG_LAZY(logging::Level::DEBUG, log << "No more space in VPM, aborting spilling!" << logging::endl);
-                noMoreSpace = true;
-                break;
-            }
-
-            spilledAreas[spillArea].emplace(&localNode);
-            CPPLOG_LAZY(logging::Level::DEBUG,
-                log << "Spilling local '" << loc->name << "' with rating: " << entry.first << logging::endl);
-
-            if(instructionMapping.empty())
-            {
-                // create this mapping once to not need to iterate over all instructions again and again
-                for(auto it = method.walkAllInstructions(); !it.isEndOfMethod(); it.nextInMethod())
-                {
-                    if(auto combinedOp = it.get<intermediate::CombinedOperation>())
-                    {
-                        if(auto op = combinedOp->getFirstOp())
-                            instructionMapping.emplace(op, it);
-                        if(auto op = combinedOp->getSecondOp())
-                            instructionMapping.emplace(op, it);
-                    }
-                    else if(it.has())
-                        instructionMapping.emplace(it.get(), it);
-                }
-            }
-
-            // since we modify the users, need to create a copy first
-            auto accessGroups =
-                groupSpillAccesses(loc->getUsers(), instructionMapping, config.additionalOptions.accumulatorThreshold);
-            for(auto& group : accessGroups)
-            {
-                auto it = group.mainAccess;
-                bool mutexAlreadyLocked = isInMutexLock(it);
-                // Since the qpu_number register is on register-file B, need to split the offset calculation up
-                auto qpuNum = assign(it, TYPE_INT8, "%spill_qpu_offset") = Value(REG_QPU_NUMBER, TYPE_INT8);
-                auto offset = assign(it, TYPE_INT8, "%spill_qpu_offset") = qpuNum * 64_lit; // 16 elements * 4Byte
-                Value groupValue = UNDEFINED_VALUE;
-                auto groupValueType =
-                    (loc->type.getPointerType() ? TYPE_INT32 : loc->type).toVectorType(NATIVE_VECTOR_SIZE);
-                if(group.mainAccessUse.readsLocal())
-                {
-                    // insert read from VPM before access and replace the local with a temporary
-                    groupValue = method.addNewLocal(groupValueType, loc->name, "spill_read");
-                    auto beforeIt = it.copy().previousInBlock();
-                    it = method.vpm->insertReadVPM(method, it, groupValue, *spillArea, !mutexAlreadyLocked, offset);
-                    it->replaceValue(loc->createReference(), groupValue, LocalUse::Type::READER);
-                    auto lowerIt = beforeIt;
-                    while(lowerIt != it && !lowerIt.isEndOfBlock())
-                        lowerIt = periphery::lowerVPMAccess(method, lowerIt).nextInBlock();
-                    while(beforeIt != it && !beforeIt.isEndOfBlock())
-                        beforeIt =
-                            normalization::handleImmediate(method.module, method, beforeIt, config).nextInBlock();
-                }
-                if(group.mainAccessUse.writesLocal())
-                {
-                    // insert write to VPM after access and replace the local with a temporary
-                    groupValue = method.addNewLocal(groupValueType, loc->name, "spill_write");
-                    auto beforeIt = it.copy().previousInBlock();
-                    it->replaceValue(loc->createReference(), groupValue, LocalUse::Type::WRITER);
-                    it.nextInBlock();
-                    it = method.vpm->insertWriteVPM(method, it, groupValue, *spillArea, !mutexAlreadyLocked, offset);
-                    auto lowerIt = beforeIt;
-                    while(lowerIt != it && !lowerIt.isEndOfBlock())
-                        lowerIt = periphery::lowerVPMAccess(method, lowerIt).nextInBlock();
-                    while(beforeIt != it && !beforeIt.isEndOfBlock())
-                        beforeIt =
-                            normalization::handleImmediate(method.module, method, beforeIt, config).nextInBlock();
-                }
-                for(auto* reader : group.additionalReaders)
-                {
-                    reader->replaceLocal(loc, groupValue, LocalUse::Type::READER);
-                }
-            }
-
-            PROFILE_COUNTER_SCOPE(
-                vc4c::profiler::COUNTER_BACKEND, "Locals spilled", method.metaData.getMaximumInstancesCount());
-            spilledLocals = true;
-        }
-        if(noMoreSpace)
-            break;
+            orderedCandidates.emplace_back(loc, entry.first);
     }
 
-    CPPLOG_LAZY_BLOCK(logging::Level::DEBUG, method.vpm->dumpUsage());
-    method.dumpInstructions();
-    return spilledLocals ? FixupResult::FIXES_APPLIED_RECREATE_GRAPH : FixupResult::NOTHING_FIXED;
+    return runSpillCandidates(method, config, coloredGraph, orderedCandidates, false);
+}
+
+FixupResult qpu_asm::spillFailingLocals(Method& method, const Configuration& config, GraphColoring& coloredGraph)
+{
+    // Spill only a few locals per attempt: every additional spill costs a VPM row plus a load/store per access and we
+    // want to give the recoloring a chance to converge before spending more.
+    static constexpr std::size_t MAX_LOCALS_PER_ROUND = 2;
+
+    struct FailingCandidate
+    {
+        const Local* local;
+        std::size_t degree;
+    };
+
+    std::vector<FailingCandidate> candidates;
+    for(const auto* loc : coloredGraph.getUnassignedLocals())
+    {
+        if(loc->countUsers(LocalUse::Type::WRITER) != 1)
+            // multiple writers would need a read-modify-write for every write, which the spill implementation does not
+            // support (yet)
+            continue;
+        auto type = loc->type;
+        if(type.getPointerType() || !type.isVectorType() || type.getVectorWidth() != NATIVE_VECTOR_SIZE ||
+            type.getScalarBitCount() != 32)
+            // the spill area holds exactly one 32-bit vector covering all lanes per QPU; scalar (uniform) locals,
+            // partial vectors and narrower types would need a different representation
+            continue;
+        auto usage = coloredGraph.getLocalUses().find(loc);
+        if(usage == coloredGraph.getLocalUses().end() || usage->second.associatedInstructions.size() < 2)
+            // not used (properly), spilling cannot help
+            continue;
+        if(usage->second.isFullVectorRotated)
+            // the reload would be placed in a register selected by the register allocator, which cannot be constrained
+            // to the full-vector-rotate register-set
+            continue;
+        candidates.push_back(FailingCandidate{loc, coloredGraph.getGraph().assertNode(loc).getEdgesSize()});
+    }
+
+    // Highest degree first: these locals block the most other locals, so spilling them frees the most registers.
+    // stable_sort to keep the (deterministic) order of the error set for equal degrees.
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const FailingCandidate& left, const FailingCandidate& right) { return left.degree > right.degree; });
+    if(candidates.size() > MAX_LOCALS_PER_ROUND)
+        candidates.resize(MAX_LOCALS_PER_ROUND);
+
+    std::vector<std::pair<const Local*, float>> toSpill;
+    toSpill.reserve(candidates.size());
+    for(const auto& candidate : candidates)
+    {
+        CPPLOG_LAZY(logging::Level::DEBUG,
+            log << "Trying to spill failing local '" << candidate.local->name << "' with degree " << candidate.degree
+                << logging::endl);
+        toSpill.emplace_back(candidate.local, static_cast<float>(candidate.degree));
+    }
+
+    return runSpillCandidates(method, config, coloredGraph, toSpill, true);
 }

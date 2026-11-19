@@ -1551,6 +1551,17 @@ const ColoredGraph& GraphColoring::getGraph() const
     return graph;
 }
 
+const SortedSet<const Local*, LocalIdGreater>& GraphColoring::getUnassignedLocals() const
+{
+    return errorSet;
+}
+
+bool GraphColoring::hasValueCopyConflicts() const
+{
+    return std::any_of(
+        errorSet.begin(), errorSet.end(), [](const Local* local) -> bool { return needsValueCopy(local); });
+}
+
 void GraphColoring::resetGraph()
 {
     // reset the graph and the closed- and open sets
